@@ -1,0 +1,81 @@
+name: deploy
+
+# Build the bidder Docker image and push it to ECR, but only after the e2e
+# suite has passed on main. Triggered by e2e.yml's completion rather than
+# push directly, so a red e2e run never reaches ECR/the VM.
+# The VM (see teads-sess-2026/infra terraform) pulls this image.
+#
+# All teams share one ECR repo (no push isolation between teams), so images
+# are disambiguated by a <team>-<tag> prefix derived from this repo's name
+# (bidder-<team> -> <team>). Config below is expected to be set once as
+# ORGANIZATION-level variables/secrets on teads-sess-2026 (repo-level values
+# still override if set):
+#
+# Required config:
+#   Variables:  ECR_REPOSITORY  (shared repo URI, `terraform output bidder_ecr_repo`)
+#               AWS_REGION      (optional; defaults to eu-west-1)
+#   Secrets:    AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+#               (shared push credentials — `terraform output bidder_push_credentials`)
+on:
+  workflow_run:
+    workflows: [e2e]
+    types: [completed]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      AWS_ACCESS_KEY_ID_SET: ${{ secrets.AWS_ACCESS_KEY_ID != '' }}
+      DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+    steps:
+      - name: Check configuration
+        run: |
+          if [ -z "$ECR_REPOSITORY" ]; then
+            echo "::error::Set the ECR_REPOSITORY variable (shared ECR repo URI)."
+            exit 1
+          fi
+          if [ "$AWS_ACCESS_KEY_ID_SET" != "true" ]; then
+            echo "::error::Set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY secrets."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
+
+      - name: Derive team tag prefix from repo name
+        run: echo "TEAM=${GITHUB_REPO_NAME#bidder-}" >> "$GITHUB_ENV"
+        env:
+          GITHUB_REPO_NAME: ${{ github.event.repository.name }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'eu-west-1' }}
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ vars.ECR_REPOSITORY }}:${{ env.TEAM }}-latest
+            ${{ vars.ECR_REPOSITORY }}:${{ env.TEAM }}-${{ env.DEPLOY_SHA }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -6,53 +6,30 @@ PORT         ?= 8080
 BIDDER_ID    ?= teads-bidder
 DB_HOST      ?= localhost
 REDIS_HOST   ?= $(DB_HOST)
+CREATIVE_BUDGET ?= 25.0
+SCHEMA       := bidder_$(shell echo $(BIDDER_ID) | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/_/g')
 
-.PHONY: help infra-up infra-down infra-reset infra-logs infra-tailscale install build run run-team down test clean
+.PHONY: help install build run run-team run-docker restart-bidder down test clean
 
 help:
 	@echo ""
 	@echo "  Bidder — Summer School 2026"
 	@echo ""
-	@echo "  Infrastructure"
-	@echo "    make infra-up          Start Postgres + Kafka + Kafka UI"
-	@echo "    make infra-down        Stop infrastructure"
-	@echo "    make infra-reset       Wipe all data and restart infrastructure"
-	@echo "    make infra-logs        Tail infrastructure logs"
+	@echo "  Infrastructure (Postgres/Kafka/Redis/Prometheus/Grafana) lives in the ssp"
+	@echo "  repo now — run 'make run' there first. This repo only runs the bidder app,"
+	@echo "  joining that stack's 'ss2026-net' Docker network."
 	@echo ""
 	@echo "  Bidder"
 	@echo "    make install           Download all Maven dependencies"
 	@echo "    make build             Compile and package (skip tests)"
-	@echo "    make run               Start bidder on port 8080 (Postgres, schema bidder_teads_bidder)"
-	@echo "    make run-team          Custom port/id:  make run-team PORT=8081 BIDDER_ID=team-alpha [DB_HOST=100.x.x.x]"
+	@echo "    make run               Build & run the bidder container on port 8080 (schema bidder_teads_bidder)"
+	@echo "    make run-team          Custom port/id:  make run-team PORT=8081 BIDDER_ID=team-alpha"
+	@echo "    make run-docker        Alias for 'make run'"
+	@echo "    make restart-bidder    Reset this bidder's budget in Postgres+Redis and restart the bidder container"
+	@echo "    make down              Stop the bidder container"
 	@echo "    make test              Run unit tests"
 	@echo "    make clean             Remove build artifacts"
 	@echo ""
-
-# ── Infrastructure ────────────────────────────────────────────────────────────
-
-infra-up:
-	docker compose up -d
-	@docker compose ps
-
-infra-down:
-	docker compose down -v --remove-orphans
-	-docker rm -f ss2026-postgres ss2026-kafka ss2026-kafka-ui ss2026-redis ss2026-prometheus ss2026-grafana 2>/dev/null
-	-lsof -ti:8080 | xargs kill -9 2>/dev/null || true
-
-infra-reset:
-	docker compose down -v
-	docker compose up -d
-
-infra-logs:
-	docker compose logs -f
-
-down: infra-down
-
-infra-tailscale:
-	@if [ -z "$(TAILSCALE_IP)" ]; then echo "Usage: make infra-tailscale TAILSCALE_IP=100.x.x.x"; exit 1; fi
-	TAILSCALE_IP=$(TAILSCALE_IP) docker compose up -d --force-recreate kafka
-	@echo "Kafka now advertising $(TAILSCALE_IP):9093"
-	@echo "Remote bidders: KAFKA_BOOTSTRAP_SERVERS=$(TAILSCALE_IP):9093"
 
 # ── Install / Build ──────────────────────────────────────────────────────────
 
@@ -66,13 +43,37 @@ build:
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 
-run:
-	$(MVN) spring-boot:run \
-	  -Dspring-boot.run.jvmArguments="-DDB_HOST=$(DB_HOST) -DREDIS_HOST=$(REDIS_HOST) -Dspring.kafka.bootstrap-servers=$(KAFKA_BOOTSTRAP_SERVERS)"
+# Runs the "bidder" service from docker-compose.yml, joining the external
+# "ss2026-net" network started by the ssp repo's `make run` (docker-compose.all.yml)
+# — that must already be running, since Postgres/Kafka/Redis live there now.
+# PORT/BIDDER_ID are exported by the `export` directive above, so docker compose
+# picks them up automatically.
+run: run-docker
 
 run-team:
-	$(MVN) spring-boot:run \
-	  -Dspring-boot.run.jvmArguments="-Dserver.port=$(PORT) -Dbidder.id=$(BIDDER_ID) -DDB_HOST=$(DB_HOST) -DREDIS_HOST=$(REDIS_HOST) -Dspring.kafka.bootstrap-servers=$(KAFKA_BOOTSTRAP_SERVERS)"
+	docker compose up -d --build bidder
+	@echo "✓ Bidder running in Docker on port $(PORT) (schema $(SCHEMA))"
+	@docker compose logs -f bidder
+
+run-docker:
+	docker compose up -d --build bidder
+	@echo "✓ Bidder running in Docker on port $${PORT:-8080}"
+	@docker compose logs -f bidder
+
+down:
+	docker compose down
+
+# Resets this bidder's remaining budget back to CREATIVE_BUDGET in Postgres, then restarts
+# the bidder container. On boot, CreativeSeeder re-syncs Redis from the (now-reset) Postgres
+# value, so both stores come back full. Requires the bidder to be running via `make run-docker`.
+# Talks to the ss2026-postgres container directly (it's owned by the ssp repo's compose file,
+# not this one).
+restart-bidder:
+	@echo "Resetting budget for bidder '$(BIDDER_ID)' (schema $(SCHEMA)) to $(CREATIVE_BUDGET)"
+	docker exec -i ss2026-postgres psql -U bidder -d summerschool -c \
+	  "UPDATE $(SCHEMA).creatives SET budget = $(CREATIVE_BUDGET) WHERE bidder_id = '$(BIDDER_ID)';"
+	docker compose restart bidder
+	@echo "✓ Bidder restarted — budget reset to $(CREATIVE_BUDGET) in Postgres and Redis"
 
 # ── Test ──────────────────────────────────────────────────────────────────────
 

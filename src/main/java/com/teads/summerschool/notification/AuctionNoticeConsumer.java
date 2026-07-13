@@ -34,7 +34,8 @@ public class AuctionNoticeConsumer {
         this.metrics = metrics;
     }
 
-    @KafkaListener(topics = "${kafka.topic.auction-notifications}")
+    @KafkaListener(topics = "${kafka.topic.auction-notifications}",
+            autoStartup = "${spring.kafka.listener.auto-startup:true}")
     @Transactional
     public void consume(byte[] message) {
         try {
