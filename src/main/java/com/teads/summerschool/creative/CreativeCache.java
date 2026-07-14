@@ -8,11 +8,12 @@ import org.springframework.stereotype.Component;
 import java.util.List;
 
 /**
- * In-memory copy of this bidder's creative catalog. Creative definitions (targeting,
- * max bid price) never change after CreativeSeeder seeds them — only budget mutates,
- * and bid() never reads Creative.getBudget() (remaining budget lives in Redis, see
- * BidderStatsCache) — so loading this once, right after seeding, is enough. Removes a
- * Postgres round trip from every single bid() call.
+ * Lookup for this bidder's creative catalog. Originally snapshotted the catalog once
+ * (right after CreativeSeeder seeded it) to save a Postgres round trip per bid() call,
+ * but creatives can be added/removed after startup faster than any cache could track —
+ * a stale snapshot then either hides a just-added creative or keeps matching one that's
+ * already gone. getAll() reads straight from Postgres each time to stay correct;
+ * revisit only with a cache invalidated by the write path itself, not time.
  */
 @Component
 public class CreativeCache {
@@ -21,7 +22,6 @@ public class CreativeCache {
 
     private final CreativeRepository repository;
     private final BidderProperties properties;
-    private volatile List<Creative> creatives = List.of();
 
     public CreativeCache(CreativeRepository repository, BidderProperties properties) {
         this.repository = repository;
@@ -29,12 +29,11 @@ public class CreativeCache {
     }
 
     public List<Creative> getAll() {
-        return creatives;
+        return repository.findByBidderId(properties.getId());
     }
 
-    /** Reload from Postgres. Called once by CreativeSeeder right after it seeds/verifies the catalog. */
+    /** Kept for CreativeSeeder, which logs the catalog size right after seeding. */
     public void refresh() {
-        creatives = List.copyOf(repository.findByBidderId(properties.getId()));
-        log.info("Creative cache loaded: {} creatives", creatives.size());
+        log.info("Creative catalog seeded: {} creatives", getAll().size());
     }
 }
