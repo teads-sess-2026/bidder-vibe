@@ -1,35 +1,36 @@
 package com.teads.summerschool.record;
 
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.r2dbc.repository.Query;
+import org.springframework.data.r2dbc.repository.R2dbcRepository;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 import java.time.LocalDateTime;
 import java.util.Collection;
-import java.util.List;
-import java.util.Optional;
 
-public interface BidRecordRepository extends JpaRepository<BidRecord, Long> {
+public interface BidRecordRepository extends R2dbcRepository<BidRecord, Long> {
 
-    Optional<BidRecord> findByRequestId(String requestId);
+    Mono<BidRecord> findByRequestId(String requestId);
 
-    long countByBidPriceIsNotNull();
+    Mono<Long> countByBidPriceIsNotNull();
 
-    List<BidRecord> findByBidPriceIsNotNull();
+    Flux<BidRecord> findByBidPriceIsNotNull();
 
-    List<BidRecord> findByCreatedAtAfter(LocalDateTime since);
+    Flux<BidRecord> findByCreatedAtAfter(LocalDateTime since);
 
-    List<BidRecord> findAllByRequestIdIn(Collection<String> requestIds);
+    Flux<BidRecord> findAllByRequestIdIn(Collection<String> requestIds);
 
-    @Query("SELECT b.noBidReason, COUNT(b) FROM BidRecord b WHERE b.noBidReason IS NOT NULL GROUP BY b.noBidReason")
-    List<Object[]> countGroupByNoBidReason();
+    @Query("SELECT no_bid_reason, COUNT(*) AS cnt FROM bid_record WHERE no_bid_reason IS NOT NULL GROUP BY no_bid_reason")
+    Flux<NoBidReasonCount> countGroupByNoBidReason();
 
-    @Query("SELECT COALESCE(AVG(b.bidPrice), 0) FROM BidRecord b WHERE b.bidPrice IS NOT NULL")
-    double avgBidPrice();
+    @Query("SELECT COALESCE(AVG(bid_price), 0) FROM bid_record WHERE bid_price IS NOT NULL")
+    Mono<Double> avgBidPrice();
 
-    @Query("SELECT b.latencyMs FROM BidRecord b WHERE b.latencyMs IS NOT NULL ORDER BY b.latencyMs")
-    List<Integer> findAllLatenciesSorted();
+    @Query("SELECT latency_ms FROM bid_record WHERE latency_ms IS NOT NULL ORDER BY latency_ms")
+    Flux<Integer> findAllLatenciesSorted();
 
-    @Query("SELECT MIN(b.createdAt) FROM BidRecord b")
-    Optional<LocalDateTime> findFirstCreatedAt();
+    @Query("SELECT MIN(created_at) FROM bid_record")
+    Mono<LocalDateTime> findFirstCreatedAt();
 
+    record NoBidReasonCount(String noBidReason, long cnt) {}
 }

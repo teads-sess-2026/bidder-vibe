@@ -4,8 +4,8 @@ import com.teads.summerschool.config.BidderProperties;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
-
-import java.util.List;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * Lookup for this bidder's creative catalog. Originally snapshotted the catalog once
@@ -28,12 +28,14 @@ public class CreativeCache {
         this.properties = properties;
     }
 
-    public List<Creative> getAll() {
+    public Flux<Creative> getAll() {
         return repository.findByBidderId(properties.getId());
     }
 
     /** Kept for CreativeSeeder, which logs the catalog size right after seeding. */
-    public void refresh() {
-        log.info("Creative catalog seeded: {} creatives", getAll().size());
+    public Mono<Void> refresh() {
+        return getAll().count()
+                .doOnNext(n -> log.info("Creative catalog seeded: {} creatives", n))
+                .then();
     }
 }

@@ -1,10 +1,9 @@
 package com.teads.summerschool.creative;
 
-import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.r2dbc.repository.R2dbcRepository;
+import reactor.core.publisher.Flux;
 
-import java.util.List;
+public interface CreativeRepository extends R2dbcRepository<Creative, String> {
 
-public interface CreativeRepository extends JpaRepository<Creative, String> {
-
-    List<Creative> findByBidderId(String bidderId);
+    Flux<Creative> findByBidderId(String bidderId);
 }

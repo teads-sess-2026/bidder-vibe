@@ -1,27 +1,20 @@
 package com.teads.summerschool.notification;
 
-import jakarta.persistence.*;
+import org.springframework.data.annotation.Id;
+import org.springframework.data.annotation.PersistenceCreator;
+import org.springframework.data.relational.core.mapping.Table;
 import java.time.LocalDateTime;
 
-@Entity
+@Table("win_notice")
 public class WinNotice {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    @Column(nullable = false)
     private String requestId;
-
-    @Column(nullable = false)
     private String bidderId;
-
-    @Column(nullable = false)
     private double clearingPrice;
-
     private double bidPrice;
-
-    @Column(nullable = false)
     private LocalDateTime receivedAt = LocalDateTime.now();
 
     public WinNotice() {}
@@ -31,6 +24,19 @@ public class WinNotice {
         this.bidderId = bidderId;
         this.clearingPrice = clearingPrice;
         this.bidPrice = bidPrice;
+    }
+
+    // Used only by Spring Data R2DBC to materialize rows read back from the database — the
+    // no-setter public constructor above has no way to populate id/receivedAt from a stored row.
+    @PersistenceCreator
+    WinNotice(Long id, String requestId, String bidderId, double clearingPrice, double bidPrice,
+              LocalDateTime receivedAt) {
+        this.id = id;
+        this.requestId = requestId;
+        this.bidderId = bidderId;
+        this.clearingPrice = clearingPrice;
+        this.bidPrice = bidPrice;
+        this.receivedAt = receivedAt;
     }
 
     public Long getId() { return id; }

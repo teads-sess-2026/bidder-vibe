@@ -6,10 +6,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import reactor.core.publisher.Mono;
 
+import java.time.Duration;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
 
 @RestController
 public class BidController {
@@ -25,30 +25,30 @@ public class BidController {
     }
 
     @PostMapping("/api/bid")
-    public CompletableFuture<ResponseEntity<?>> bid(@RequestBody BidRequest request) {
-        return CompletableFuture
-                .supplyAsync(() -> biddingService.bid(request))
-                .orTimeout(properties.getTimeoutMs(), TimeUnit.MILLISECONDS)
-                .thenApply(opt -> {
+    public Mono<ResponseEntity<?>> bid(@RequestBody BidRequest request) {
+        return biddingService.bid(request)
+                .map(opt -> {
                     if (opt.isPresent()) {
                         return (ResponseEntity<?>) ResponseEntity.ok(opt.get());
                     }
                     return (ResponseEntity<?>) ResponseEntity.noContent().build();
                 })
-                .exceptionally(ex -> {
+                .timeout(Duration.ofMillis(properties.getTimeoutMs()))
+                .onErrorResume(ex -> {
                     Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
                     log.warn("<< BID TIMEOUT  id={} — {}: {}", request.requestId(),
                             cause.getClass().getSimpleName(), cause.getMessage(), cause);
-                    return ResponseEntity.noContent().build();
+                    return Mono.just(ResponseEntity.noContent().build());
                 });
     }
 
     @GetMapping("/api/budget")
-    public ResponseEntity<Map<String, Object>> budget() {
-        return ResponseEntity.ok(Map.of(
-                "remaining", biddingService.getRemainingBudget(),
-                "creatives", biddingService.getRemainingBudgets()
-        ));
+    public Mono<ResponseEntity<Map<String, Object>>> budget() {
+        return Mono.zip(biddingService.getRemainingBudget(), biddingService.getRemainingBudgets())
+                .map(tuple -> ResponseEntity.ok(Map.of(
+                        "remaining", tuple.getT1(),
+                        "creatives", tuple.getT2()
+                )));
     }
 
     @GetMapping("/health")

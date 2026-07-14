@@ -11,7 +11,7 @@ public class BidderProperties {
     private double budget = 1000.0;
     // Flat budget assigned to each creative on seed; remaining is tracked per creative in Redis.
     private double creativeBudget = 25.0;
-    private long timeoutMs = 100;
+    private long timeoutMs = 1000;
     private Strategy strategy = new Strategy();
     private Competition competition = new Competition();
 

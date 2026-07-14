@@ -15,15 +15,16 @@ import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
 
 @Service
 public class BiddingService {
@@ -69,13 +70,17 @@ public class BiddingService {
      * own, so an unbounded gauge supplier here stalls the entire scrape response.
      * Bound it the same way /api/bid bounds biddingService.bid(), and fall back to the
      * last known value instead of blocking Prometheus forever.
+     *
+     * <p>Micrometer's Gauge contract takes a plain synchronous Supplier<Number>, polled by the
+     * Prometheus scrape thread — there's no reactive variant, so this is the one sanctioned
+     * .block() outside of startup/Kafka-listener boundaries elsewhere in this codebase.
      */
     private double getRemainingBudgetSafe() {
         try {
-            double value = CompletableFuture.supplyAsync(this::getRemainingBudget)
-                    .orTimeout(properties.getTimeoutMs(), TimeUnit.MILLISECONDS)
-                    .exceptionally(ex -> lastKnownBudget)
-                    .join();
+            Double value = getRemainingBudget()
+                    .timeout(Duration.ofMillis(properties.getTimeoutMs()))
+                    .onErrorReturn(lastKnownBudget)
+                    .block();
             lastKnownBudget = value;
             return value;
         } catch (Exception ex) {
@@ -83,13 +88,14 @@ public class BiddingService {
         }
     }
 
-    public Optional<BidResponse> bid(BidRequest request) {
+    public Mono<Optional<BidResponse>> bid(BidRequest request) {
         // TODO: implement your bidding strategy
         // Hints:
         //   1. Record the request with buildRecord(request)
         //   2. Find matching creatives with matchingCreatives(request, creativeCache.getAll())
         //   3. Filter creatives whose maxBidPrice covers this floor: c.isWithinMaxBid(request.floorPrice())
         //   4. Filter creatives that still have budget: statsCache.getRemainingBudget(c.getId()) > 0
+        //      (returns a Mono<Double> — flatMap/filterWhen into it)
         //   5. Compute a bid price with computeBidPrice(request)
         //   6. Record metrics: metrics.recordRequest(), metrics.recordBid(), metrics.recordNoBid(reason)
         //   7. Call ownBidCache.record(requestId, creativeId, bidPrice) so AuctionNoticeConsumer
@@ -103,8 +109,7 @@ public class BiddingService {
         long start = System.nanoTime();
         record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
         metrics.recordLatency(0);
-        bidRecordRepository.save(record);
-        return Optional.empty();
+        return bidRecordRepository.save(record).thenReturn(Optional.empty());
     }
 
     private double computeBidPrice(BidRequest request) {
@@ -115,28 +120,24 @@ public class BiddingService {
     }
 
     /** Total remaining budget across all this bidder's creatives. */
-    public double getRemainingBudget() {
-        return creativeCache.getAll().stream()
-                .mapToDouble(c -> statsCache.getRemainingBudget(c.getId()))
-                .sum();
+    public Mono<Double> getRemainingBudget() {
+        return creativeCache.getAll()
+                .flatMap(c -> statsCache.getRemainingBudget(c.getId()))
+                .reduce(0.0, Double::sum);
     }
 
     /** Remaining budget per creative id. */
-    public Map<String, Double> getRemainingBudgets() {
-        Map<String, Double> budgets = new LinkedHashMap<>();
-        for (Creative c : creativeCache.getAll()) {
-            budgets.put(c.getId(), statsCache.getRemainingBudget(c.getId()));
-        }
-        return budgets;
+    public Mono<Map<String, Double>> getRemainingBudgets() {
+        return creativeCache.getAll()
+                .flatMap(c -> statsCache.getRemainingBudget(c.getId()).map(budget -> Map.entry(c.getId(), budget)))
+                .collectMap(Map.Entry::getKey, Map.Entry::getValue, LinkedHashMap::new);
     }
 
-    private List<Creative> matchingCreatives(BidRequest request, List<Creative> all) {
-        return all.stream()
-                .filter(c -> c.matches(
+    private Flux<Creative> matchingCreatives(BidRequest request, Flux<Creative> all) {
+        return all.filter(c -> c.matches(
                         request.targeting().geo(),
                         request.targeting().deviceType(),
-                        request.targeting().audienceSegment()))
-                .toList();
+                        request.targeting().audienceSegment()));
     }
 
     private CreativeDto toCreativeDto(Creative creative) {

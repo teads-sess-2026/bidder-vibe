@@ -57,6 +57,9 @@ public class AuctionNoticeConsumer {
                 // Hints:
                 //   - ourBid.creativeId() / ourBid.bidPrice() is what we bid on this auction
                 //   - Call statsCache.recordWin(ourBid.creativeId(), notice.getClearingPrice())
+                //     (returns a Mono<Double>) and winNoticeRepository.save(...) (returns a
+                //     Mono<WinNotice>) — safe to .block() here, this listener runs on its own
+                //     dedicated Kafka consumer thread, not the Netty event loop
                 //   - Call metrics.recordWin(notice.getClearingPrice())
                 //   - Save a WinNotice via winNoticeRepository.save(...)
                 log.info("** WIN  id={} creative={} clearing={} — not yet handled",

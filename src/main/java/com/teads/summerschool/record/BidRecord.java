@@ -1,17 +1,15 @@
 package com.teads.summerschool.record;
 
-import jakarta.persistence.*;
+import org.springframework.data.annotation.Id;
+import org.springframework.data.relational.core.mapping.Table;
 import java.time.LocalDateTime;
 
-@Entity
-@Table(uniqueConstraints = @UniqueConstraint(columnNames = "requestId"))
+@Table("bid_record")
 public class BidRecord {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    @Column(nullable = false)
     private String requestId;
 
     private double floorPrice;
@@ -30,7 +28,6 @@ public class BidRecord {
     // Null when we submitted a bid.
     private String noBidReason;
 
-    @Column(nullable = false)
     private LocalDateTime createdAt = LocalDateTime.now();
 
     public BidRecord() {}

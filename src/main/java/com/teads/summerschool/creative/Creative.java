@@ -1,13 +1,13 @@
 package com.teads.summerschool.creative;
 
-import jakarta.persistence.Column;
-import jakarta.persistence.Entity;
-import jakarta.persistence.Id;
-import jakarta.persistence.Table;
+import org.springframework.data.annotation.Id;
+import org.springframework.data.annotation.PersistenceCreator;
+import org.springframework.data.annotation.Transient;
+import org.springframework.data.domain.Persistable;
+import org.springframework.data.relational.core.mapping.Table;
 
-@Entity
-@Table(name = "creatives")
-public class Creative {
+@Table("creatives")
+public class Creative implements Persistable<String> {
 
     @Id
     private String id;
@@ -27,15 +27,41 @@ public class Creative {
     private Double maxBidPrice;
 
     // Comma-separated values; empty string means no restriction
-    @Column(length = 512)
     private String allowedGeos = "";
-    @Column(length = 512)
     private String allowedDevices = "";
-    @Column(length = 512)
     private String audienceSegments = "";
+
+    // id is client-assigned (not DB-generated), so R2DBC can't infer new-vs-existing from a
+    // null-id check the way it does for auto-generated PKs. isNew defaults true for rows built
+    // by application code (e.g. CreativeSeeder) and false for rows materialized from the DB via
+    // the @PersistenceCreator constructor below — see Persistable<String>.
+    @Transient
+    private boolean isNew = true;
 
     public Creative() {}
 
+    @PersistenceCreator
+    Creative(String id, String name, String description, String imageUrl, String callToAction,
+              String bidderId, double budget, Double maxBidPrice,
+              String allowedGeos, String allowedDevices, String audienceSegments) {
+        this.id = id;
+        this.name = name;
+        this.description = description;
+        this.imageUrl = imageUrl;
+        this.callToAction = callToAction;
+        this.bidderId = bidderId;
+        this.budget = budget;
+        this.maxBidPrice = maxBidPrice;
+        this.allowedGeos = allowedGeos;
+        this.allowedDevices = allowedDevices;
+        this.audienceSegments = audienceSegments;
+        this.isNew = false;
+    }
+
+    @Override
+    public boolean isNew() { return isNew; }
+
+    @Override
     public String getId() { return id; }
     public void setId(String id) { this.id = id; }
 
