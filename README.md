@@ -14,6 +14,33 @@ Three areas are stubbed — look for `// TODO` comments:
 
 ---
 
+## Local development (no AWS/ssp repo needed)
+
+Want to run and test your bidder standalone, without the AWS-hosted infra or the ssp
+repo? Bring up your own local Postgres/Kafka/Redis/Prometheus/Grafana, then run the
+bidder against it:
+
+```bash
+make run       # starts local infra (if not already up) + the bidder container
+```
+
+`make run` = `make run-infra` + `make run-docker` — see `make help` to run either step
+on its own (`make run-infra`, `make down-infra`, `make infra-logs`).
+
+This creates the same `ss2026-net` Docker network the ssp repo's `docker-compose.all.yml`
+creates, so only run one or the other — not both at once.
+
+|                | URL |
+|---|---|
+| Kafka UI  | http://localhost:8090 |
+| Redis UI  | http://localhost:8091 |
+| Prometheus | http://localhost:9090 |
+| Grafana   | http://localhost:3000 (admin / admin) |
+
+Once your bidder is running, see [Testing your bidder](#testing-your-bidder) below.
+
+---
+
 ## Workshop setup
 
 Infrastructure (Postgres/Kafka/Redis/Prometheus/Grafana) runs on an always-on AWS VM
@@ -92,6 +119,49 @@ make clean                                           Remove build artifacts
 | `GET /api/stats/targeting` | Breakdown by geo / device / segment |
 | `GET /api/stats/timeseries` | Time-bucketed trend data |
 | `GET /actuator/prometheus` | Prometheus metrics |
+
+---
+
+## Testing your bidder
+
+Once it's running (`make run`, default port 8080), print ready-to-copy examples with:
+
+```bash
+make curl-examples                 # or: make curl-examples PORT=8081
+```
+
+Or run them directly:
+
+```bash
+# Health check
+curl http://localhost:8080/health
+
+# Send a bid request (mirrors what the SSP sends)
+curl -X POST http://localhost:8080/api/bid \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "request_id": "test-1",
+    "floor_price": 0.10,
+    "targeting": {
+      "geo": "US",
+      "device_type": "mobile",
+      "audience_segment": "tech"
+    }
+  }'
+# → 200 with a bid body if you bid, or 204 No Content if you pass.
+
+# Check remaining budget
+curl http://localhost:8080/api/budget
+
+# Dashboard/API stats
+curl http://localhost:8080/api/stats
+curl http://localhost:8080/api/stats/creatives
+curl http://localhost:8080/api/stats/targeting
+curl http://localhost:8080/api/stats/timeseries
+
+# Prometheus metrics
+curl http://localhost:8080/actuator/prometheus
+```
 
 ---
 
