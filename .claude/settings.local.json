@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(MSYS_NO_PATHCONV=1 docker images)",
+      "Bash(docker system *)",
+      "Bash(docker compose *)"
+    ]
+  }
+}

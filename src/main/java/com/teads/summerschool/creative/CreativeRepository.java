@@ -6,4 +6,5 @@ import reactor.core.publisher.Flux;
 public interface CreativeRepository extends R2dbcRepository<Creative, String> {
 
     Flux<Creative> findByBidderId(String bidderId);
+
 }

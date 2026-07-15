@@ -62,8 +62,11 @@ public class CreativeSeeder implements ApplicationRunner {
                                     c.getId(), e.getMessage());
                             return Mono.empty();
                         }))
-                .thenMany(Mono.defer(creativeCache::refresh))
-                .blockLast();
+                // Drop any stale cached catalog so the first read repopulates from the rows we
+                // just seeded — invalidation is driven by this write path, not a TTL.
+                .then(creativeCache.invalidate())
+                .then(Mono.defer(creativeCache::refresh))
+                .block();
     }
 
     private Creative creative(String creativeId, String name, String description,

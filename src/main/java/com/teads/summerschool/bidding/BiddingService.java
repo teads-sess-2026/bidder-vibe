@@ -19,19 +19,18 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Random;
 
 @Service
 public class BiddingService {
 
     private static final Logger log = LoggerFactory.getLogger(BiddingService.class);
-
-    private final Random random = new Random();
 
     private final BidderProperties properties;
     private final CreativeCache creativeCache;
@@ -88,35 +87,168 @@ public class BiddingService {
         }
     }
 
+    /**
+     * Efficiency-first bidding: bid only on eligible creatives and only as much as it takes
+     * to win. Eligibility follows CONFLUENCE F1–F3 order — max-bid cap, then targeting, then
+     * remaining budget — and among eligible creatives we pick the most specific (least
+     * wildcarded) one, tie-breaking on remaining budget so spend spreads out.
+     */
     public Mono<Optional<BidResponse>> bid(BidRequest request) {
-        // TODO: implement your bidding strategy
-        // Hints:
-        //   1. Record the request with buildRecord(request)
-        //   2. Find matching creatives with matchingCreatives(request, creativeCache.getAll())
-        //   3. Filter creatives whose maxBidPrice covers this floor: c.isWithinMaxBid(request.floorPrice())
-        //   4. Filter creatives that still have budget: statsCache.getRemainingBudget(c.getId()) > 0
-        //      (returns a Mono<Double> — flatMap/filterWhen into it)
-        //   5. Compute a bid price with computeBidPrice(request)
-        //   6. Record metrics: metrics.recordRequest(), metrics.recordBid(), metrics.recordNoBid(reason)
-        //   7. Call ownBidCache.record(requestId, creativeId, bidPrice) so AuctionNoticeConsumer
-        //      can look this bid up without a DB round trip
-        //   8. Save the BidRecord with bidRecordRepository.save(record) and return
-        //      Optional.of(new BidResponse(...)) or Optional.empty()
-        metrics.recordRequest();
-        metrics.recordNoBid("not_implemented");
-        BidRecord record = buildRecord(request);
-        record.setNoBidReason("not_implemented");
         long start = System.nanoTime();
-        record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
-        metrics.recordLatency(0);
+        metrics.recordRequest();
+        BidRecord record = buildRecord(request);
+        double floor = request.floorPrice();
+
+        // A null targeting block is treated as fully unrestricted (matches wildcard creatives).
+        String geo = request.targeting() == null ? null : request.targeting().geo();
+        String deviceType = request.targeting() == null ? null : request.targeting().deviceType();
+        String audienceSegment = request.targeting() == null ? null : request.targeting().audienceSegment();
+
+        return creativeCache.getAll().collectList().flatMap(all -> {
+            if (all.isEmpty()) {
+                return noBid(record, "no_eligible_creative", start);
+            }
+            // F3: a creative must never be chosen for a floor above its cap — checked before
+            // targeting and budget.
+            List<Creative> withinMax = all.stream()
+                    .filter(c -> c.isWithinMaxBid(floor))
+                    .toList();
+            if (withinMax.isEmpty()) {
+                return noBid(record, "floor_exceeds_max_bid", start);
+            }
+            // F1: targeting match.
+            List<Creative> matched = withinMax.stream()
+                    .filter(c -> c.matches(geo, deviceType, audienceSegment))
+                    .toList();
+            if (matched.isEmpty()) {
+                return noBid(record, "targeting_miss", start);
+            }
+            // F2: only creatives that still have budget (> 0). One Redis read per matched
+            // creative, run concurrently; carry the remaining budget along for ranking + pacing.
+            return Flux.fromIterable(matched)
+                    .flatMap(c -> statsCache.getRemainingBudget(c.getId())
+                            .map(budget -> Map.entry(c, budget)))
+                    .filter(e -> e.getValue() > 0)
+                    .collectList()
+                    .flatMap(eligible -> {
+                        if (eligible.isEmpty()) {
+                            return noBid(record, "budget_exhausted", start);
+                        }
+                        // Prefer the most specific creative (fewer wildcard fields), so the
+                        // Universal creative is a fallback rather than the default; tie-break on
+                        // higher remaining budget to spread spend across creatives.
+                        Map.Entry<Creative, Double> best = eligible.stream()
+                                .max(Comparator
+                                        .comparingInt((Map.Entry<Creative, Double> e) -> specificity(e.getKey()))
+                                        .thenComparingDouble(Map.Entry::getValue))
+                                .orElseThrow();
+                        Creative creative = best.getKey();
+                        double remaining = best.getValue();
+                        double bidPrice = computeBidPrice(request, creative, remaining);
+
+                        // Let the win-notice consumer attribute a win to this bid without a DB hit.
+                        ownBidCache.record(request.requestId(), creative.getId(), bidPrice);
+
+                        record.setBidPrice(bidPrice);
+                        record.setCreativeId(creative.getId());
+                        record.setLatencyMs(elapsedMs(start));
+                        metrics.recordBid();
+                        metrics.recordLatency(elapsedMs(start));
+
+                        BidResponse response = new BidResponse(
+                                request.requestId(), bidPrice, toCreativeDto(creative));
+                        return bidRecordRepository.save(record).thenReturn(Optional.of(response));
+                    });
+        });
+    }
+
+    /** Record a no-bid with its reason + latency and return an empty (204) response. */
+    private Mono<Optional<BidResponse>> noBid(BidRecord record, String reason, long start) {
+        record.setNoBidReason(reason);
+        record.setLatencyMs(elapsedMs(start));
+        metrics.recordNoBid(reason);
+        metrics.recordLatency(elapsedMs(start));
         return bidRecordRepository.save(record).thenReturn(Optional.empty());
     }
 
-    private double computeBidPrice(BidRequest request) {
-        // TODO: implement your pricing strategy
-        // The bid must be above request.floorPrice().
-        // Use properties.getStrategy() for tuning parameters.
-        return request.floorPrice() * 1.01;
+    /**
+     * Efficiency-first price: estimate the market clearing price and bid just enough over it.
+     * Cold start (too few observed wins) falls back to a small markup over the floor. High-value
+     * (specific) inventory gets a premium, and a pacing multiplier keeps each creative's budget
+     * alive across the competition window. Always kept strictly above the floor and never above
+     * the creative's remaining budget.
+     */
+    private double computeBidPrice(BidRequest request, Creative creative, double remainingBudget) {
+        double floor = request.floorPrice();
+        BidderProperties.Strategy s = properties.getStrategy();
+
+        double base;
+        if (statsCache.getSampleCount() < s.getMinSamples()) {
+            // Not enough observed clearing prices to trust the market signal yet.
+            base = floor * s.getColdStartMultiplier();
+        } else {
+            // Bid just over the observed market: low when we win easily, higher when we lose.
+            double market = Math.max(floor, statsCache.getRollingAverageWinPrice());
+            base = market * s.getMarketMultiplier();
+        }
+
+        // Premium for highly-targeted (specific) inventory — worth more, worth winning.
+        if (specificity(creative) >= 2) {
+            base *= s.getPremiumMultiplier();
+        }
+
+        base *= pacingMultiplier(creative, remainingBudget);
+
+        // Never overspend a creative in a single win, but always stay strictly above the floor.
+        double floorGuard = floor * 1.0001;
+        double capped = Math.min(base, Math.max(remainingBudget, floorGuard));
+        double price = Math.max(capped, floorGuard);
+        // Round to 4 dp; re-guard in case rounding nudged us to the floor.
+        price = Math.round(price * 10_000.0) / 10_000.0;
+        return price <= floor ? floorGuard : price;
+    }
+
+    /**
+     * Pace spend across the competition window: if we've spent less of this creative's budget
+     * than the fraction of time elapsed, bid up (we can afford to); if we're ahead of pace, bid
+     * down. Disabled (returns 1.0) when competition.start-time is unset.
+     */
+    private double pacingMultiplier(Creative creative, double remainingBudget) {
+        BidderProperties.Competition comp = properties.getCompetition();
+        if (comp.getStartTime() == null || comp.getStartTime().isBlank()) {
+            return 1.0;
+        }
+        double elapsedFraction;
+        try {
+            Instant startTime = Instant.parse(comp.getStartTime());
+            double elapsedSeconds = Duration.between(startTime, Instant.now()).toMillis() / 1000.0;
+            elapsedFraction = elapsedSeconds / comp.getDurationSeconds();
+        } catch (Exception e) {
+            return 1.0;
+        }
+        elapsedFraction = Math.max(0.0, Math.min(1.0, elapsedFraction));
+
+        double fullBudget = properties.getCreativeBudget();
+        double spentFraction = fullBudget <= 0 ? 0.0
+                : Math.max(0.0, Math.min(1.0, 1.0 - remainingBudget / fullBudget));
+
+        BidderProperties.Strategy s = properties.getStrategy();
+        // Under-pacing (spent less than time elapsed) → boost; over-pacing → cut.
+        return spentFraction < elapsedFraction ? s.getPacingBoost() : s.getPacingCut();
+    }
+
+    /** How specific a creative's targeting is: count of non-wildcard dimensions (0–3). */
+    private int specificity(Creative creative) {
+        int count = 0;
+        if (creative.getAllowedGeos() != null && !creative.getAllowedGeos().isBlank()) count++;
+        if (creative.getAllowedDevices() != null && !creative.getAllowedDevices().isBlank()) count++;
+        if (creative.getAudienceSegments() != null && !creative.getAudienceSegments().isBlank()) count++;
+        return count;
+    }
+
+    /** Milliseconds elapsed since a System.nanoTime() start marker. */
+    private int elapsedMs(long startNanos) {
+        return (int) ((System.nanoTime() - startNanos) / 1_000_000);
     }
 
     /** Total remaining budget across all this bidder's creatives. */
@@ -131,13 +263,6 @@ public class BiddingService {
         return creativeCache.getAll()
                 .flatMap(c -> statsCache.getRemainingBudget(c.getId()).map(budget -> Map.entry(c.getId(), budget)))
                 .collectMap(Map.Entry::getKey, Map.Entry::getValue, LinkedHashMap::new);
-    }
-
-    private Flux<Creative> matchingCreatives(BidRequest request, Flux<Creative> all) {
-        return all.filter(c -> c.matches(
-                        request.targeting().geo(),
-                        request.targeting().deviceType(),
-                        request.targeting().audienceSegment()));
     }
 
     private CreativeDto toCreativeDto(Creative creative) {
