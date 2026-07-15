@@ -200,7 +200,7 @@ public class BiddingService {
         base *= pacingMultiplier(creative, remainingBudget);
 
         // Never overspend a creative in a single win, but always stay strictly above the floor.
-        double floorGuard = floor * 1.0001;
+        double floorGuard = floor * 1.015;
         double capped = Math.min(base, Math.max(remainingBudget, floorGuard));
         double price = Math.max(capped, floorGuard);
         // Round to 4 dp; re-guard in case rounding nudged us to the floor.
