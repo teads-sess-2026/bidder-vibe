@@ -67,9 +67,6 @@ public class BiddingService {
     void registerBudgetGauge() {
         metrics.registerGauge("budget.remaining", this::getRemainingBudgetSafe);
 
-        // Resolve the pacing anchor once at startup. setIfAbsent in Redis means the first boot's
-        // instant is kept across restarts, so pacing always has a stable start to measure from —
-        // it no longer silently disables itself just because competition.start-time is unset.
         try {
             Instant resolved = statsCache.getOrInitPacingAnchor(bootInstant).block();
             if (resolved != null) {
@@ -86,18 +83,6 @@ public class BiddingService {
                 properties.getCompetition().getDurationSeconds());
     }
 
-    /**
-     * getRemainingBudget() does a DB query plus one Redis call per creative — under
-     * DB/Redis pool contention (e.g. remote backing services with WAN latency) it can
-     * queue for a connection indefinitely. /actuator/prometheus has no timeout of its
-     * own, so an unbounded gauge supplier here stalls the entire scrape response.
-     * Bound it the same way /api/bid bounds biddingService.bid(), and fall back to the
-     * last known value instead of blocking Prometheus forever.
-     *
-     * <p>Micrometer's Gauge contract takes a plain synchronous Supplier<Number>, polled by the
-     * Prometheus scrape thread — there's no reactive variant, so this is the one sanctioned
-     * .block() outside of startup/Kafka-listener boundaries elsewhere in this codebase.
-     */
     private double getRemainingBudgetSafe() {
         try {
             Double value = getRemainingBudget()
@@ -111,12 +96,6 @@ public class BiddingService {
         }
     }
 
-    /**
-     * Efficiency-first bidding: bid only on eligible creatives and only as much as it takes
-     * to win. Eligibility follows CONFLUENCE F1–F3 order — max-bid cap, then targeting, then
-     * remaining budget — and among eligible creatives we pick the most specific (least
-     * wildcarded) one, tie-breaking on remaining budget so spend spreads out.
-     */
     public Mono<Optional<BidResponse>> bid(BidRequest request) {
         long start = System.nanoTime();
         metrics.recordRequest();
@@ -168,7 +147,19 @@ public class BiddingService {
                                 .orElseThrow();
                         Creative creative = best.getKey();
                         double remaining = best.getValue();
-                        double bidPrice = computeBidPrice(request, creative, remaining);
+
+                        // Pacing throttle: when we are ahead of the back-loaded target spend curve,
+                        // probabilistically skip the auction instead of just shaving the price. In a
+                        // second-price auction a floored bid still WINS and still SPENDS, so price
+                        // cuts alone can't conserve budget — skipping does. Released in the endgame
+                        // (see shouldThrottle) so banked budget is spent down on cheap, uncontested
+                        // late auctions, which is where the fill rate collapses and wins are cheapest.
+                        PacingState pacing = pacingState(remaining);
+                        if (shouldThrottle(pacing)) {
+                            return noBid(record, "paced_throttle", start);
+                        }
+
+                        double bidPrice = computeBidPrice(request, pacing);
 
                         // Let the win-notice consumer attribute a win to this bid without a DB hit.
                         ownBidCache.record(request.requestId(), creative.getId(), bidPrice);
@@ -198,11 +189,11 @@ public class BiddingService {
     /**
      * Efficiency-first price: estimate the market clearing price and bid just enough over it.
      * Cold start (too few observed wins) falls back to a small markup over the floor. A pacing
-     * multiplier then scales the bid up or down to keep each creative's budget alive across the
+     * multiplier then scales the bid up or down to keep the creative's budget alive across the
      * whole competition window — this is the sole price modifier. Always kept strictly above the
      * floor and never above the creative's remaining budget.
      */
-    private double computeBidPrice(BidRequest request, Creative creative, double remainingBudget) {
+    private double computeBidPrice(BidRequest request, PacingState pacing) {
         double floor = request.floorPrice();
         BidderProperties.Strategy s = properties.getStrategy();
 
@@ -225,18 +216,26 @@ public class BiddingService {
             base = market * s.getMarketMultiplier();
         }
 
-        base *= pacingMultiplier(creative, remainingBudget);
+        base *= pacingMultiplier(pacing);
 
         // Never overspend a creative in a single win, but always stay strictly above the floor.
-        double floorGuard = floor * 1.02;
-        double capped = Math.min(base, Math.max(remainingBudget, floorGuard));
+        double floorGuard = floor * 1.15;
+        double capped = Math.min(base, Math.max(pacing.remainingBudget(), floorGuard));
         double price = Math.max(capped, floorGuard);
         // Round to 4 dp; re-guard in case rounding nudged us to the floor.
         price = Math.round(price * 10_000.0) / 10_000.0;
         return price <= floor ? floorGuard : price;
     }
 
-    private double pacingMultiplier(Creative creative, double remainingBudget) {
+    /**
+     * A snapshot of where we are against the pacing plan for one bid: how far into the window we
+     * are, how much budget we have already spent, and the remaining budget of the chosen creative.
+     * The back-loaded target-spend curve and both pacing controls (price multiplier + throttle)
+     * are derived from this, so they always agree on the same elapsed/spent view.
+     */
+    private record PacingState(double elapsedFraction, double spentFraction, double remainingBudget) {}
+
+    private PacingState pacingState(double remainingBudget) {
         BidderProperties.Competition comp = properties.getCompetition();
         // Resolve the pacing start: an explicit competition.start-time wins; otherwise fall back
         // to the persisted pacing anchor (Redis-backed boot instant). Pacing is therefore always
@@ -253,16 +252,52 @@ public class BiddingService {
             startTime = pacingAnchor;
         }
         double elapsedSeconds = Duration.between(startTime, Instant.now()).toMillis() / 1000.0;
-        double elapsedFraction = elapsedSeconds / comp.getDurationSeconds();
-        elapsedFraction = Math.max(0.0, Math.min(1.0, elapsedFraction));
+        double elapsedFraction = Math.max(0.0, Math.min(1.0, elapsedSeconds / comp.getDurationSeconds()));
 
         double fullBudget = properties.getCreativeBudget();
         double spentFraction = fullBudget <= 0 ? 0.0
                 : Math.max(0.0, Math.min(1.0, 1.0 - remainingBudget / fullBudget));
 
+        return new PacingState(elapsedFraction, spentFraction, remainingBudget);
+    }
+
+    /** Back-loaded target spend at this point in the window: elapsedFraction ^ curveExponent. */
+    private double targetSpent(double elapsedFraction) {
+        return Math.pow(elapsedFraction, properties.getStrategy().getPacingCurveExponent());
+    }
+
+    /**
+     * Should we skip this auction to conserve budget? A price cut alone can't conserve budget in a
+     * second-price auction (a floored bid still wins and still spends), so when we are ahead of the
+     * back-loaded target curve we probabilistically no-bid instead. Once past the release fraction
+     * we never throttle — the endgame is where fill rate collapses and wins are cheapest, so we
+     * spend the banked budget down there.
+     */
+    private boolean shouldThrottle(PacingState p) {
         BidderProperties.Strategy s = properties.getStrategy();
-        // Continuous, proportional response: +gap when under-pacing, -gap when over-pacing.
-        double gap = elapsedFraction - spentFraction;
+        if (p.elapsedFraction() >= s.getThrottleReleaseFraction()) {
+            return false;
+        }
+        double ahead = p.spentFraction() - targetSpent(p.elapsedFraction());
+        if (ahead <= 0.0) {
+            return false; // on or behind the target curve — always bid
+        }
+        double skipProb = Math.min(s.getThrottleMaxSkip(), s.getThrottleSensitivity() * ahead);
+        return Math.random() < skipProb;
+    }
+
+    private double pacingMultiplier(PacingState p) {
+        BidderProperties.Strategy s = properties.getStrategy();
+        // Endgame spend-down: once the throttle has released, any budget still unspent is a wasted
+        // win (the score is win COUNT, so an undrained dollar is pure loss). Late auctions clear at
+        // ~floor and fill rate is collapsing, so winning MORE of the scarce inventory is the only
+        // way to drain in time — bid at the max boost, not just at market, while budget remains.
+        if (p.elapsedFraction() >= s.getThrottleReleaseFraction() && p.spentFraction() < 1.0) {
+            return s.getPacingBoost();
+        }
+        // Otherwise a continuous, proportional response against the same back-loaded target the
+        // throttle uses: bid up when behind the target curve, down when ahead of it.
+        double gap = targetSpent(p.elapsedFraction()) - p.spentFraction();
         double multiplier = 1.0 + s.getPacingSensitivity() * gap;
         // Clamp so a big gap can't send the bid to an absurd multiple or below the floor guard.
         return Math.max(s.getPacingCut(), Math.min(s.getPacingBoost(), multiplier));

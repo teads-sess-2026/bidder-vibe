@@ -36,22 +36,19 @@ public class CreativeSeeder implements ApplicationRunner {
     public void run(ApplicationArguments args) {
         String id = properties.getId();
 
-        // Coverage-first creative pool (same count as before, so total deployable
-        // budget is unchanged — this is a coverage fix, not a budget grab). Wins are
-        // the leaderboard currency and geo carries NO value signal in this competition,
-        // so geo-restricting a creative can only subtract coverage: its per-creative
-        // budget sits idle whenever that geo's traffic is scarce while the wildcard
-        // pools exhaust. We therefore run FOUR fully-wildcard creatives. Since all four
-        // are equally (un)specific, the bidder's ranker tie-breaks on remaining budget,
-        // so spend drains evenly across all four and none of the $100 gets stranded.
+        // A SINGLE fully-wildcard creative holding the whole budget. Wins are the leaderboard
+        // currency and geo/device/segment carry NO value signal in this competition, so any
+        // targeting restriction can only subtract coverage; one wildcard pool serves everywhere.
+        // Consolidating from four identical wildcards to one is a latency + pacing fix, not a
+        // budget change: total deployable budget is still bidder.creative-budget (raised to hold
+        // what the four pools held together). Benefits — one Redis budget GET per bid instead of
+        // up to four (lower tail latency, fewer timeouts), and pacing steers one whole budget so
+        // no fraction gets stranded in a pool that never drains.
         //
-        // TODO: tune targeting (geos, devices, segments) and maxBidPrice (highest floor
-        // this creative will bid on; null = unbounded) to match your strategy.
+        // TODO: tune maxBidPrice (highest floor this creative will bid on; null = unbounded) to
+        // match your strategy. Leave targeting wildcard unless a value signal appears.
         List<Creative> seedCreatives = List.of(
-                creative(id + "-creative-1", "Universal",   "No restrictions — serves everywhere",     "", "", ""),
-                creative(id + "-creative-2", "Universal 2", "Second wildcard pool for broad coverage", "", "", ""),
-                creative(id + "-creative-3", "Universal 3", "Third wildcard pool for broad coverage",  "", "", ""),
-                creative(id + "-creative-4", "Universal 4", "Fourth wildcard pool for broad coverage", "", "", "")
+                creative(id + "-creative-1", "Universal", "No restrictions — serves everywhere", "", "", "")
         );
 
         repository.findByBidderId(id).hasElements()
