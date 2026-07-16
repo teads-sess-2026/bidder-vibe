@@ -9,6 +9,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import reactor.core.publisher.Mono;
 
 import java.util.Map;
 import java.util.Set;
@@ -29,39 +30,39 @@ public class StatsController {
 
     /** GET /api/stats — overall snapshot */
     @GetMapping
-    public ResponseEntity<StatsResponse> stats() {
-        return ResponseEntity.ok(statsService.getStats());
+    public Mono<ResponseEntity<StatsResponse>> stats() {
+        return statsService.getStats().map(ResponseEntity::ok);
     }
 
     /** GET /api/stats/creatives?creative_id=&sort=spend&order=desc */
     @GetMapping("/creatives")
-    public ResponseEntity<?> creatives(
+    public Mono<ResponseEntity<?>> creatives(
             @RequestParam(required = false) String creative_id,
             @RequestParam(defaultValue = "spend") String sort,
             @RequestParam(defaultValue = "desc") String order) {
 
-        if (!VALID_SORT.contains(sort))  return ResponseEntity.badRequest().body(Map.of("error", "invalid sort: " + sort));
-        if (!VALID_ORDER.contains(order)) return ResponseEntity.badRequest().body(Map.of("error", "invalid order: " + order));
+        if (!VALID_SORT.contains(sort))  return Mono.just(ResponseEntity.badRequest().body(Map.of("error", "invalid sort: " + sort)));
+        if (!VALID_ORDER.contains(order)) return Mono.just(ResponseEntity.badRequest().body(Map.of("error", "invalid order: " + order)));
 
-        return ResponseEntity.ok(statsService.getCreativeStats(creative_id, sort, order));
+        return statsService.getCreativeStats(creative_id, sort, order).map(ResponseEntity::ok);
     }
 
     /** GET /api/stats/targeting?dimension=all */
     @GetMapping("/targeting")
-    public ResponseEntity<?> targeting(
+    public Mono<ResponseEntity<?>> targeting(
             @RequestParam(defaultValue = "all") String dimension) {
 
-        if (!VALID_DIM.contains(dimension)) return ResponseEntity.badRequest().body(Map.of("error", "invalid dimension: " + dimension));
+        if (!VALID_DIM.contains(dimension)) return Mono.just(ResponseEntity.badRequest().body(Map.of("error", "invalid dimension: " + dimension)));
 
-        return ResponseEntity.ok(statsService.getTargetingStats(dimension));
+        return statsService.getTargetingStats(dimension).map(ResponseEntity::ok);
     }
 
     /** GET /api/stats/timeseries?window_minutes=30&bucket_seconds=60 */
     @GetMapping("/timeseries")
-    public ResponseEntity<TimeseriesResponse> timeseries(
+    public Mono<ResponseEntity<TimeseriesResponse>> timeseries(
             @RequestParam(name = "window_minutes", defaultValue = "30") int windowMinutes,
             @RequestParam(name = "bucket_seconds", defaultValue = "60") int bucketSeconds) {
 
-        return ResponseEntity.ok(statsService.getTimeseries(windowMinutes, bucketSeconds));
+        return statsService.getTimeseries(windowMinutes, bucketSeconds).map(ResponseEntity::ok);
     }
 }

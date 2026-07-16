@@ -53,6 +53,13 @@ public class BidderStatsCache {
     private final AtomicLong winCount = new AtomicLong(0);
     private final Deque<Double> recentWinPrices = new ArrayDeque<>();
 
+    // The observed *market* price window: clearing prices from auctions we won AND lost.
+    // Loss clearing prices are the market signal the bidder was previously blind to — they
+    // tell us what it cost to win auctions we didn't, so pricing off this fuller window
+    // (rather than win prices alone, which only ever sample at/below what we already win)
+    // lets us bid just enough to clear the market instead of overshooting.
+    private final Deque<Double> recentMarketPrices = new ArrayDeque<>();
+
     public BidderStatsCache(BidderProperties properties, ReactiveRedisTemplate<String, String> redis,
                              CreativeRepository creativeRepository) {
         this.properties = properties;
@@ -73,6 +80,11 @@ public class BidderStatsCache {
     /** Redis key holding this bidder's cumulative win count. */
     private String winCountKey() {
         return properties.getId() + "_win_count";
+    }
+
+    /** Redis key holding the capped list of recent market clearing prices (wins + losses). */
+    private String marketPricesKey() {
+        return properties.getId() + "_market_prices";
     }
 
     /**
@@ -106,8 +118,24 @@ public class BidderStatsCache {
                     }
                 }
             }
-            log.info("Warm-loaded market stats from Redis: winCount={} priceSamples={}",
-                    winCount.get(), recentWinPrices.size());
+            List<String> marketPrices = redis.opsForList().range(marketPricesKey(), 0, -1)
+                    .collectList()
+                    .onErrorReturn(List.of())
+                    .block();
+            if (marketPrices != null && !marketPrices.isEmpty()) {
+                synchronized (recentMarketPrices) {
+                    recentMarketPrices.clear();
+                    for (String p : marketPrices) {
+                        try {
+                            recentMarketPrices.addLast(Double.parseDouble(p));
+                        } catch (NumberFormatException ignored) {
+                            // Skip a malformed entry rather than abort the whole warm-load.
+                        }
+                    }
+                }
+            }
+            log.info("Warm-loaded market stats from Redis: winCount={} winPriceSamples={} marketPriceSamples={}",
+                    winCount.get(), recentWinPrices.size(), recentMarketPrices.size());
         } catch (Exception e) {
             log.warn("Market-stats warm-load skipped (non-fatal): {}", e.getMessage());
         }
@@ -137,12 +165,9 @@ public class BidderStatsCache {
                 .doOnNext(after -> {
                     // Fast in-memory read path for the reactive bid loop.
                     winCount.incrementAndGet();
-                    synchronized (recentWinPrices) {
-                        recentWinPrices.addLast(clearingPrice);
-                        if (recentWinPrices.size() > properties.getStrategy().getWindowSize()) {
-                            recentWinPrices.pollFirst();
-                        }
-                    }
+                    pushCapped(recentWinPrices, clearingPrice);
+                    // A win's clearing price is also a market observation.
+                    pushCapped(recentMarketPrices, clearingPrice);
                 })
                 // Durable, cross-restart/replica copy of the same signals. Best-effort: a Redis
                 // failure here must not undo the (already-committed) budget decrement, so swallow
@@ -150,18 +175,54 @@ public class BidderStatsCache {
                 .flatMap(after -> recordWinStats(clearingPrice).thenReturn(after));
     }
 
-    /** Persist the win to the durable Redis learning signals (win count + capped price window). */
+    /** Persist the win to the durable Redis learning signals (win count + capped price windows). */
     private Mono<Void> recordWinStats(double clearingPrice) {
         int windowSize = properties.getStrategy().getWindowSize();
         return redis.opsForValue().increment(winCountKey())
                 .then(redis.opsForList().rightPush(winPricesKey(), String.valueOf(clearingPrice)))
                 // Keep only the last windowSize entries — mirrors the in-memory deque cap.
                 .then(redis.opsForList().trim(winPricesKey(), -windowSize, -1))
+                // A win's clearing price is also a market observation.
+                .then(pushMarketPriceRedis(clearingPrice))
                 .onErrorResume(e -> {
                     log.warn("Durable win-stats update failed (non-fatal): {}", e.getMessage());
                     return Mono.empty();
                 })
                 .then();
+    }
+
+    /**
+     * Record the clearing price of an auction we bid on but LOST. This is the market signal
+     * the bidder was previously blind to: it's exactly what it would have cost to win, so it
+     * anchors pricing to the real market rather than to the (cheaper) subset we already win.
+     * Updates the fast in-memory market window immediately, then mirrors to Redis best-effort.
+     * Safe to call from the Kafka consumer thread.
+     */
+    public Mono<Void> recordLoss(double clearingPrice) {
+        pushCapped(recentMarketPrices, clearingPrice);
+        return pushMarketPriceRedis(clearingPrice)
+                .onErrorResume(e -> {
+                    log.warn("Durable loss-price update failed (non-fatal): {}", e.getMessage());
+                    return Mono.empty();
+                });
+    }
+
+    /** Append a market clearing price to the durable Redis window, trimmed to windowSize. */
+    private Mono<Void> pushMarketPriceRedis(double clearingPrice) {
+        int windowSize = properties.getStrategy().getWindowSize();
+        return redis.opsForList().rightPush(marketPricesKey(), String.valueOf(clearingPrice))
+                .then(redis.opsForList().trim(marketPricesKey(), -windowSize, -1))
+                .then();
+    }
+
+    /** Append to a capped in-memory price window under its own lock. */
+    private void pushCapped(Deque<Double> window, double price) {
+        synchronized (window) {
+            window.addLast(price);
+            if (window.size() > properties.getStrategy().getWindowSize()) {
+                window.pollFirst();
+            }
+        }
     }
 
     /** Remaining budget for a creative. Lazily initializes to the flat creative budget if missing. */
@@ -185,9 +246,29 @@ public class BidderStatsCache {
     }
 
     public double getRollingAverageWinPrice() {
-        synchronized (recentWinPrices) {
-            if (recentWinPrices.isEmpty()) return 0.0;
-            return recentWinPrices.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
+        return averageOf(recentWinPrices);
+    }
+
+    /**
+     * Rolling average of recent market clearing prices (wins AND losses) — the fuller,
+     * less-biased estimate of what it currently costs to win. Prefer this over
+     * getRollingAverageWinPrice() for pricing once loss samples exist.
+     */
+    public double getRollingAverageMarketPrice() {
+        return averageOf(recentMarketPrices);
+    }
+
+    /** Number of clearing-price samples (wins + losses) in the market window. */
+    public long getMarketSampleCount() {
+        synchronized (recentMarketPrices) {
+            return recentMarketPrices.size();
+        }
+    }
+
+    private double averageOf(Deque<Double> window) {
+        synchronized (window) {
+            if (window.isEmpty()) return 0.0;
+            return window.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
         }
     }
 

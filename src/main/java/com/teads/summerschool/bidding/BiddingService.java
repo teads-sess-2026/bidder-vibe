@@ -173,34 +173,38 @@ public class BiddingService {
 
     /**
      * Efficiency-first price: estimate the market clearing price and bid just enough over it.
-     * Cold start (too few observed wins) falls back to a small markup over the floor. High-value
-     * (specific) inventory gets a premium, and a pacing multiplier keeps each creative's budget
-     * alive across the competition window. Always kept strictly above the floor and never above
-     * the creative's remaining budget.
+     * Cold start (too few observed wins) falls back to a small markup over the floor. A pacing
+     * multiplier then scales the bid up or down to keep each creative's budget alive across the
+     * whole competition window — this is the sole price modifier. Always kept strictly above the
+     * floor and never above the creative's remaining budget.
      */
     private double computeBidPrice(BidRequest request, Creative creative, double remainingBudget) {
         double floor = request.floorPrice();
         BidderProperties.Strategy s = properties.getStrategy();
 
         double base;
-        if (statsCache.getSampleCount() < s.getMinSamples()) {
+        // Prefer the fuller market window (wins AND losses) once we have enough samples —
+        // loss clearing prices reveal what it actually costs to win, so this is a far less
+        // biased estimate than win prices alone (which only sample at/below what we already
+        // win). Fall back to the win-only average, then to cold-start, as samples thin out.
+        double marketAvg = statsCache.getMarketSampleCount() >= s.getMinSamples()
+                ? statsCache.getRollingAverageMarketPrice()
+                : (statsCache.getSampleCount() >= s.getMinSamples()
+                        ? statsCache.getRollingAverageWinPrice()
+                        : 0.0);
+        if (marketAvg <= 0.0) {
             // Not enough observed clearing prices to trust the market signal yet.
             base = floor * s.getColdStartMultiplier();
         } else {
             // Bid just over the observed market: low when we win easily, higher when we lose.
-            double market = Math.max(floor, statsCache.getRollingAverageWinPrice());
+            double market = Math.max(floor, marketAvg);
             base = market * s.getMarketMultiplier();
-        }
-
-        // Premium for highly-targeted (specific) inventory — worth more, worth winning.
-        if (specificity(creative) >= 2) {
-            base *= s.getPremiumMultiplier();
         }
 
         base *= pacingMultiplier(creative, remainingBudget);
 
         // Never overspend a creative in a single win, but always stay strictly above the floor.
-        double floorGuard = floor * 1.015;
+        double floorGuard = floor * 1.02;
         double capped = Math.min(base, Math.max(remainingBudget, floorGuard));
         double price = Math.max(capped, floorGuard);
         // Round to 4 dp; re-guard in case rounding nudged us to the floor.
@@ -208,11 +212,6 @@ public class BiddingService {
         return price <= floor ? floorGuard : price;
     }
 
-    /**
-     * Pace spend across the competition window: if we've spent less of this creative's budget
-     * than the fraction of time elapsed, bid up (we can afford to); if we're ahead of pace, bid
-     * down. Disabled (returns 1.0) when competition.start-time is unset.
-     */
     private double pacingMultiplier(Creative creative, double remainingBudget) {
         BidderProperties.Competition comp = properties.getCompetition();
         if (comp.getStartTime() == null || comp.getStartTime().isBlank()) {
@@ -233,8 +232,11 @@ public class BiddingService {
                 : Math.max(0.0, Math.min(1.0, 1.0 - remainingBudget / fullBudget));
 
         BidderProperties.Strategy s = properties.getStrategy();
-        // Under-pacing (spent less than time elapsed) → boost; over-pacing → cut.
-        return spentFraction < elapsedFraction ? s.getPacingBoost() : s.getPacingCut();
+        // Continuous, proportional response: +gap when under-pacing, -gap when over-pacing.
+        double gap = elapsedFraction - spentFraction;
+        double multiplier = 1.0 + s.getPacingSensitivity() * gap;
+        // Clamp so a big gap can't send the bid to an absurd multiple or below the floor guard.
+        return Math.max(s.getPacingCut(), Math.min(s.getPacingBoost(), multiplier));
     }
 
     /** How specific a creative's targeting is: count of non-wildcard dimensions (0–3). */

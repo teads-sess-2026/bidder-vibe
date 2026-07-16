@@ -38,6 +38,10 @@ public class BidderProperties {
         private double premiumMultiplier = 1.5;
         private double pacingBoost = 1.20;
         private double pacingCut = 0.85;
+        // How strongly the pacing multiplier reacts to the gap between time-elapsed and
+        // budget-spent fractions. multiplier = 1 + sensitivity * gap, clamped to [cut, boost].
+        // The gap is at most ±1, so a sensitivity of 1.0 lets the full boost/cut range be reached.
+        private double pacingSensitivity = 1.0;
 
         public int getMinSamples() { return minSamples; }
         public void setMinSamples(int minSamples) { this.minSamples = minSamples; }
@@ -59,6 +63,9 @@ public class BidderProperties {
 
         public double getPacingCut() { return pacingCut; }
         public void setPacingCut(double pacingCut) { this.pacingCut = pacingCut; }
+
+        public double getPacingSensitivity() { return pacingSensitivity; }
+        public void setPacingSensitivity(double pacingSensitivity) { this.pacingSensitivity = pacingSensitivity; }
     }
 
     public static class Competition {

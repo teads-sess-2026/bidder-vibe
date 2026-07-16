@@ -70,8 +70,12 @@ public class AuctionNoticeConsumer {
                         clearingPrice,
                         ourBid.bidPrice())).block();
             } else {
-                // We bid but lost. Track it so win-rate is observable in metrics.
+                // We bid but lost. Track it so win-rate is observable in metrics, and feed the
+                // clearing price into the market window — this is exactly what it would have cost
+                // to win, the signal the bidder was previously blind to (we only ever saw prices
+                // at/below what we already won). Blocking is safe on this dedicated consumer thread.
                 metrics.recordLoss();
+                statsCache.recordLoss(notice.getClearingPrice()).block();
             }
 
         } catch (Exception e) {
