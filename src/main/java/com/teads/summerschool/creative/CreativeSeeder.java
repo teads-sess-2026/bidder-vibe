@@ -38,22 +38,20 @@ public class CreativeSeeder implements ApplicationRunner {
 
         // Coverage-first creative pool (same count as before, so total deployable
         // budget is unchanged — this is a coverage fix, not a budget grab). Wins are
-        // the leaderboard currency, so every request we can legally serve is a chance
-        // to win; narrow targeting just turns into no-bids once our one wildcard
-        // creative exhausts. We therefore run TWO fully-wildcard creatives as broad
-        // workhorses — the bidder tie-breaks equally-specific matches on remaining
-        // budget, so spend spreads across both and broad coverage lasts ~twice as
-        // long. The two targeted creatives widen their old restrictions (dropping the
-        // over-narrow segment filters and the 0.30 cap that priced US traffic out) so
-        // they add coverage rather than subtract it.
+        // the leaderboard currency and geo carries NO value signal in this competition,
+        // so geo-restricting a creative can only subtract coverage: its per-creative
+        // budget sits idle whenever that geo's traffic is scarce while the wildcard
+        // pools exhaust. We therefore run FOUR fully-wildcard creatives. Since all four
+        // are equally (un)specific, the bidder's ranker tie-breaks on remaining budget,
+        // so spend drains evenly across all four and none of the $100 gets stranded.
         //
         // TODO: tune targeting (geos, devices, segments) and maxBidPrice (highest floor
         // this creative will bid on; null = unbounded) to match your strategy.
         List<Creative> seedCreatives = List.of(
-                creative(id + "-creative-1", "Universal",        "No restrictions — serves everywhere",     "", "", ""),
-                creative(id + "-creative-2", "Universal Reserve","Second wildcard pool for broad coverage", "", "", ""),
-                creative(id + "-creative-3", "EU Broad",         "European markets, all devices/segments",  "DE,FR,GB,ES,IT,NL", "", ""),
-                creative(id + "-creative-4", "US Broad",         "US inventory, all devices/segments",      "US", "", "")
+                creative(id + "-creative-1", "Universal",   "No restrictions — serves everywhere",     "", "", ""),
+                creative(id + "-creative-2", "Universal 2", "Second wildcard pool for broad coverage", "", "", ""),
+                creative(id + "-creative-3", "Universal 3", "Third wildcard pool for broad coverage",  "", "", ""),
+                creative(id + "-creative-4", "Universal 4", "Fourth wildcard pool for broad coverage", "", "", "")
         );
 
         repository.findByBidderId(id).hasElements()

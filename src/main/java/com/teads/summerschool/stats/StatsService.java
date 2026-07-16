@@ -105,7 +105,7 @@ public class StatsService {
 
             StatsResponse.LatencyStats latencyStats = latencyStats(latencyList);
 
-            double budget = properties.getBudget();
+            double budget = remainingVal + spendVal;
             double elapsedMinutes = Math.max(0.0, Duration.between(first, LocalDateTime.now()).toMillis() / 60_000.0);
             double spendPerMinute = elapsedMinutes > 0 ? spendVal / elapsedMinutes : 0.0;
             Double projected = spendPerMinute > 0 ? remainingVal / spendPerMinute : null;

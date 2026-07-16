@@ -43,6 +43,12 @@ public class BiddingService {
     // computation times out instead of blocking the scrape thread forever.
     private volatile double lastKnownBudget = 0.0;
 
+    // When this JVM started, the fallback pacing anchor if none is configured or persisted yet.
+    private final Instant bootInstant = Instant.now();
+    // The resolved pacing anchor (persisted in Redis, so stable across restarts). Set once at
+    // startup in registerBudgetGauge(); used by pacingMultiplier when no explicit start-time is set.
+    private volatile Instant pacingAnchor = bootInstant;
+
     public BiddingService(BidderProperties properties,
                           CreativeCache creativeCache,
                           BidRecordRepository bidRecordRepository,
@@ -60,6 +66,24 @@ public class BiddingService {
     @PostConstruct
     void registerBudgetGauge() {
         metrics.registerGauge("budget.remaining", this::getRemainingBudgetSafe);
+
+        // Resolve the pacing anchor once at startup. setIfAbsent in Redis means the first boot's
+        // instant is kept across restarts, so pacing always has a stable start to measure from —
+        // it no longer silently disables itself just because competition.start-time is unset.
+        try {
+            Instant resolved = statsCache.getOrInitPacingAnchor(bootInstant).block();
+            if (resolved != null) {
+                pacingAnchor = resolved;
+            }
+        } catch (Exception e) {
+            log.warn("Pacing-anchor resolve failed, using boot instant {} (non-fatal): {}",
+                    bootInstant, e.getMessage());
+        }
+        String configured = properties.getCompetition().getStartTime();
+        boolean hasConfigured = configured != null && !configured.isBlank();
+        log.info("Pacing anchor: {} (duration={}s)",
+                hasConfigured ? "configured=" + configured : "persisted-boot=" + pacingAnchor,
+                properties.getCompetition().getDurationSeconds());
     }
 
     /**
@@ -214,17 +238,22 @@ public class BiddingService {
 
     private double pacingMultiplier(Creative creative, double remainingBudget) {
         BidderProperties.Competition comp = properties.getCompetition();
-        if (comp.getStartTime() == null || comp.getStartTime().isBlank()) {
-            return 1.0;
+        // Resolve the pacing start: an explicit competition.start-time wins; otherwise fall back
+        // to the persisted pacing anchor (Redis-backed boot instant). Pacing is therefore always
+        // active — a blank or unparseable start-time no longer silently disables it.
+        Instant startTime;
+        String configured = comp.getStartTime();
+        if (configured != null && !configured.isBlank()) {
+            try {
+                startTime = Instant.parse(configured);
+            } catch (Exception e) {
+                startTime = pacingAnchor;
+            }
+        } else {
+            startTime = pacingAnchor;
         }
-        double elapsedFraction;
-        try {
-            Instant startTime = Instant.parse(comp.getStartTime());
-            double elapsedSeconds = Duration.between(startTime, Instant.now()).toMillis() / 1000.0;
-            elapsedFraction = elapsedSeconds / comp.getDurationSeconds();
-        } catch (Exception e) {
-            return 1.0;
-        }
+        double elapsedSeconds = Duration.between(startTime, Instant.now()).toMillis() / 1000.0;
+        double elapsedFraction = elapsedSeconds / comp.getDurationSeconds();
         elapsedFraction = Math.max(0.0, Math.min(1.0, elapsedFraction));
 
         double fullBudget = properties.getCreativeBudget();

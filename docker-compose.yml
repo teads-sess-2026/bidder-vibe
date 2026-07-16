@@ -17,9 +17,11 @@ services:
       REDIS_HOST: redis
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       SERVER_PORT: 8080
-      # Pacing is DISABLED unless a start-time is set. Export these on the host before
-      # `docker compose up` (e.g. BIDDER_COMPETITION_START_TIME=2026-06-01T09:00:00Z) so
-      # the bidder spreads its budget evenly across the competition window.
+      # Pacing is always on: with no start-time it anchors to a Redis-persisted boot
+      # instant (stable across restarts). start-time is an OPTIONAL override — export it
+      # on the host before `docker compose up` (e.g.
+      # BIDDER_COMPETITION_START_TIME=2026-06-01T09:00:00Z) only if the bidder boots before
+      # the window opens. Match duration-seconds to the window length either way.
       BIDDER_COMPETITION_START_TIME: ${BIDDER_COMPETITION_START_TIME:-}
       BIDDER_COMPETITION_DURATION_SECONDS: ${BIDDER_COMPETITION_DURATION_SECONDS:-1800}
 

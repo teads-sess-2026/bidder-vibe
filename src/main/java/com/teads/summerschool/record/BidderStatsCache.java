@@ -10,6 +10,7 @@ import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Component;
 import reactor.core.publisher.Mono;
 
+import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.List;
@@ -85,6 +86,11 @@ public class BidderStatsCache {
     /** Redis key holding the capped list of recent market clearing prices (wins + losses). */
     private String marketPricesKey() {
         return properties.getId() + "_market_prices";
+    }
+
+    /** Redis key holding the pacing anchor — the instant this bidder first started spending. */
+    private String pacingAnchorKey() {
+        return properties.getId() + "_pacing_anchor";
     }
 
     /**
@@ -239,6 +245,27 @@ public class BidderStatsCache {
                 })
                 .switchIfEmpty(redis.opsForValue().setIfAbsent(key, String.valueOf(defaultBudget))
                         .thenReturn(defaultBudget));
+    }
+
+    /**
+     * The pacing anchor: the instant this bidder first started spending, used by pacing to
+     * compute how far into the competition window we are. Persisted in Redis with setIfAbsent
+     * so the FIRST boot's instant wins and survives restarts/replicas — a restarted bidder keeps
+     * pacing off its original start instead of re-anchoring to the restart moment (which would
+     * make it think it's early again and under-spend the rest of the window). Best-effort: on any
+     * Redis error, fall back to the caller-supplied instant (this JVM's boot time).
+     */
+    public Mono<Instant> getOrInitPacingAnchor(Instant fallback) {
+        String key = pacingAnchorKey();
+        return redis.opsForValue().setIfAbsent(key, fallback.toString())
+                .then(redis.opsForValue().get(key))
+                .map(Instant::parse)
+                .onErrorResume(e -> {
+                    log.warn("Pacing-anchor init failed, using boot instant {} (non-fatal): {}",
+                            fallback, e.getMessage());
+                    return Mono.just(fallback);
+                })
+                .defaultIfEmpty(fallback);
     }
 
     public long getWinCount() {
