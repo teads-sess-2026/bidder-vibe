@@ -17,6 +17,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -172,7 +173,12 @@ public class BiddingService {
 
                         BidResponse response = new BidResponse(
                                 request.requestId(), bidPrice, toCreativeDto(creative));
-                        return bidRecordRepository.save(record).thenReturn(Optional.of(response));
+                        // Persist the bid record OFF the response path: the SSP response must not wait
+                        // on a Postgres INSERT (a shared DB under load was our biggest latency/timeout
+                        // source). Fire-and-forget on the DB scheduler; a write failure is logged, not
+                        // surfaced to the auction.
+                        saveRecordAsync(record);
+                        return Mono.just(Optional.of(response));
                     });
         });
     }
@@ -183,7 +189,23 @@ public class BiddingService {
         record.setLatencyMs(elapsedMs(start));
         metrics.recordNoBid(reason);
         metrics.recordLatency(elapsedMs(start));
-        return bidRecordRepository.save(record).thenReturn(Optional.empty());
+        // As with a bid, keep the Postgres write off the response path — even 204s were paying a full
+        // INSERT round trip before responding.
+        saveRecordAsync(record);
+        return Mono.just(Optional.empty());
+    }
+
+    /**
+     * Persist a bid record without blocking the auction response. Subscribed on the bounded-elastic
+     * scheduler so the blocking-capable R2DBC save never runs on the Netty event loop, and any error
+     * is logged rather than failing (or delaying) the bid we already returned.
+     */
+    private void saveRecordAsync(BidRecord record) {
+        bidRecordRepository.save(record)
+                .subscribeOn(Schedulers.boundedElastic())
+                .subscribe(
+                        saved -> {},
+                        e -> log.warn("Async bid-record save failed (non-fatal): {}", e.getMessage()));
     }
 
     /**

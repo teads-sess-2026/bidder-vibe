@@ -9,9 +9,13 @@ import org.springframework.boot.ApplicationRunner;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Random;
 
 @Component
 @Order(Ordered.HIGHEST_PRECEDENCE + 1)
@@ -19,16 +23,32 @@ public class CreativeSeeder implements ApplicationRunner {
 
     private static final Logger log = LoggerFactory.getLogger(CreativeSeeder.class);
 
+    private static final String[] GEOS     = {"US", "DE", "FR", "GB", "ES", "IT", "NL", "SE", "PL", "BR"};
+    private static final String[] DEVICES  = {"mobile", "desktop", "tablet"};
+    private static final String[] SEGMENTS = {"sports", "tech", "fashion", "gaming", "travel", "food", "finance", "health"};
+
+    // 200 creatives × bidder.creative-budget ($25) = the whole $5,000 pool.
+    private static final int  CREATIVE_COUNT = 200;
+    private static final long SEED           = 42;
+
+    // Targeting is WIDE on purpose. geo/device/segment carry no value signal in this competition
+    // (see the winning strategy note below), so any restriction only subtracts coverage and strands
+    // that creative's $25 in a slice it rarely matches — which is what left 43% of the budget
+    // unspent last run. High wildcard probability + broad subsets keep almost every creative eligible
+    // for almost every auction, so pacing can actually drain all 200 pools. No maxBidPrice cap for the
+    // same reason: a low cap filtered creatives out of most auctions and stranded their budget.
+    private static final double WILDCARD_PROBABILITY = 0.70;
+
     private final CreativeRepository repository;
-    private final BidderProperties properties;
-    private final BidderStatsCache statsCache;
-    private final CreativeCache creativeCache;
+    private final BidderProperties   properties;
+    private final BidderStatsCache   statsCache;
+    private final CreativeCache      creativeCache;
 
     public CreativeSeeder(CreativeRepository repository, BidderProperties properties,
-                           BidderStatsCache statsCache, CreativeCache creativeCache) {
-        this.repository = repository;
-        this.properties = properties;
-        this.statsCache = statsCache;
+                          BidderStatsCache statsCache, CreativeCache creativeCache) {
+        this.repository    = repository;
+        this.properties    = properties;
+        this.statsCache    = statsCache;
         this.creativeCache = creativeCache;
     }
 
@@ -36,40 +56,55 @@ public class CreativeSeeder implements ApplicationRunner {
     public void run(ApplicationArguments args) {
         String id = properties.getId();
 
-        // A SINGLE fully-wildcard creative holding the whole budget. Wins are the leaderboard
-        // currency and geo/device/segment carry NO value signal in this competition, so any
-        // targeting restriction can only subtract coverage; one wildcard pool serves everywhere.
-        // Consolidating from four identical wildcards to one is a latency + pacing fix, not a
-        // budget change: total deployable budget is still bidder.creative-budget (raised to hold
-        // what the four pools held together). Benefits — one Redis budget GET per bid instead of
-        // up to four (lower tail latency, fewer timeouts), and pacing steers one whole budget so
-        // no fraction gets stranded in a pool that never drains.
-        //
-        // TODO: tune maxBidPrice (highest floor this creative will bid on; null = unbounded) to
-        // match your strategy. Leave targeting wildcard unless a value signal appears.
-        List<Creative> seedCreatives = List.of(
-                creative(id + "-creative-1", "Universal", "No restrictions — serves everywhere", "", "", "")
-        );
+        // Deterministic set of 200 mostly-wildcard creatives (fixed SEED = same catalog every boot).
+        Random rnd = new Random(SEED);
+        List<Creative> seedCreatives = new ArrayList<>(CREATIVE_COUNT);
+        for (int i = 1; i <= CREATIVE_COUNT; i++) {
+            seedCreatives.add(creative(id + "-creative-" + i, "Creative " + i,
+                    "Auto-generated creative #" + i,
+                    pickSubset(GEOS, rnd), pickSubset(DEVICES, rnd), pickSubset(SEGMENTS, rnd)));
+        }
 
+        // Seed AND initialize budgets only on the first boot (no existing rows). On a restart or
+        // mid-competition redeploy we skip both, so remaining budget in Redis is preserved rather than
+        // reset to full — a reset would make the bidder think nothing was spent and blow the pool.
+        // Safe if Redis was wiped but Postgres kept the rows: getRemainingBudget lazily re-inits a
+        // missing key to the flat creative budget, and recordWin's setIfAbsent does the same on a win.
         repository.findByBidderId(id).hasElements()
-                .flatMap(hasAny -> hasAny ? Mono.empty() : repository.saveAll(seedCreatives).then())
-                .thenMany(repository.findByBidderId(id))
-                // Reset each creative's remaining budget in Redis to its configured limit on startup.
-                // A transient Redis timeout on one creative shouldn't crash the whole app: getRemainingBudget
-                // already falls back to the flat creative budget for a missing key, and recordWin's
-                // setIfAbsent lazily initializes it on first win, so skipping a failed creative here is
-                // safe, not silently wrong.
-                .flatMap(c -> statsCache.initBudget(c.getId(), c.getBudget())
-                        .onErrorResume(e -> {
-                            log.warn("Failed to init budget for creative {} — will lazy-init on first read/win: {}",
-                                    c.getId(), e.getMessage());
-                            return Mono.empty();
-                        }))
-                // Drop any stale cached catalog so the first read repopulates from the rows we
-                // just seeded — invalidation is driven by this write path, not a TTL.
+                .flatMap(hasAny -> {
+                    if (hasAny) {
+                        log.info("Creatives already seeded — preserving live budgets, skipping re-init.");
+                        return Mono.empty();
+                    }
+                    return repository.saveAll(seedCreatives)
+                            .flatMap(c -> statsCache.initBudget(c.getId(), c.getBudget())
+                                    .onErrorResume(e -> {
+                                        log.warn("Failed to init budget for creative {} — will lazy-init on first read/win: {}",
+                                                c.getId(), e.getMessage());
+                                        return Mono.empty();
+                                    }))
+                            .then();
+                })
+                // Drop any stale cached catalog so the first read repopulates from the seeded rows —
+                // invalidation is driven by this write path, not a TTL.
                 .then(creativeCache.invalidate())
                 .then(Mono.defer(creativeCache::refresh))
                 .block();
+    }
+
+    /**
+     * Pick a WIDE targeting value for one dimension: most of the time no restriction at all
+     * (wildcard), and when restricted, a broad subset (at least half the options) so the creative
+     * still matches a large share of auctions. Widened from the old 0.3 wildcard / 1..N subset that
+     * stranded budget in narrowly-targeted creatives.
+     */
+    private String pickSubset(String[] options, Random rnd) {
+        if (rnd.nextDouble() < WILDCARD_PROBABILITY) return "";
+        int half = Math.max(1, options.length / 2);
+        int n = half + rnd.nextInt(options.length - half + 1); // at least half the options
+        List<String> pool = new ArrayList<>(List.of(options));
+        Collections.shuffle(pool, rnd);
+        return String.join(",", pool.subList(0, n));
     }
 
     private Creative creative(String creativeId, String name, String description,
@@ -85,6 +120,8 @@ public class CreativeSeeder implements ApplicationRunner {
         c.setAllowedDevices(devices);
         c.setAudienceSegments(segments);
         c.setBudget(properties.getCreativeBudget());
+        // No maxBidPrice cap: leave unbounded so a creative is never filtered out of an auction it
+        // otherwise matches. A cap only strands budget in this no-value-signal competition.
         return c;
     }
 }

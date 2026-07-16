@@ -244,7 +244,16 @@ public class BidderStatsCache {
                     }
                 })
                 .switchIfEmpty(redis.opsForValue().setIfAbsent(key, String.valueOf(defaultBudget))
-                        .thenReturn(defaultBudget));
+                        .thenReturn(defaultBudget))
+                // This read is on the bid hot path. A Redis timeout/error here would otherwise
+                // propagate up and blow the request's 300ms deadline (a logged BID TIMEOUT = a lost
+                // auction). Treat a transient failure as "budget available" so we still bid; the
+                // Kafka-driven recordWin remains the source of truth for actual spend.
+                .onErrorResume(e -> {
+                    log.warn("Budget read failed for {} — assuming full budget for this bid (non-fatal): {}",
+                            key, e.getMessage());
+                    return Mono.just(defaultBudget);
+                });
     }
 
     /**
