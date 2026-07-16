@@ -57,12 +57,11 @@ public class AuctionNoticeConsumer {
             log.info("KAFKA id={}, winner={}, won={}", notice.getRequestId(), notice.getWinningBidderId(), won);
 
             if (won) {
-                // Record the win: decrement the creative's remaining budget by what we actually
-                // paid (the clearing price), bump metrics, and persist the win. Blocking is safe
-                // here — this listener runs on its own dedicated Kafka consumer thread, not the
-                // Netty event loop.
+                // Record the win: update the market-learning stats, bump metrics, and persist the
+                // win. The budget key is NOT decremented here — the SSP owns spend and has already
+                // decremented it atomically. Blocking is safe here — this listener runs on its own
+                // dedicated Kafka consumer thread, not the Netty event loop.
                 double clearingPrice = notice.getClearingPrice();
-                statsCache.recordWin(ourBid.creativeId(), clearingPrice).block();
                 metrics.recordWin(clearingPrice);
                 winNoticeRepository.save(new WinNotice(
                         notice.getRequestId(),

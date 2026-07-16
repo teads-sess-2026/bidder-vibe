@@ -66,10 +66,10 @@ public class CreativeSeeder implements ApplicationRunner {
         }
 
         // Seed AND initialize budgets only on the first boot (no existing rows). On a restart or
-        // mid-competition redeploy we skip both, so remaining budget in Redis is preserved rather than
-        // reset to full — a reset would make the bidder think nothing was spent and blow the pool.
-        // Safe if Redis was wiped but Postgres kept the rows: getRemainingBudget lazily re-inits a
-        // missing key to the flat creative budget, and recordWin's setIfAbsent does the same on a win.
+        // mid-competition redeploy we skip both. The SSP is the single owner of budget spend, so
+        // initBudget only ever seeds with setIfAbsent — even a re-run can't refill an already-spent
+        // key. Safe if Redis was wiped but Postgres kept the rows: getRemainingBudget lazily
+        // re-inits a missing key (setIfAbsent) to the flat creative budget.
         repository.findByBidderId(id).hasElements()
                 .flatMap(hasAny -> {
                     if (hasAny) {
@@ -79,7 +79,7 @@ public class CreativeSeeder implements ApplicationRunner {
                     return repository.saveAll(seedCreatives)
                             .flatMap(c -> statsCache.initBudget(c.getId(), c.getBudget())
                                     .onErrorResume(e -> {
-                                        log.warn("Failed to init budget for creative {} — will lazy-init on first read/win: {}",
+                                        log.warn("Failed to seed budget for creative {} — will lazy-init on first read: {}",
                                                 c.getId(), e.getMessage());
                                         return Mono.empty();
                                     }))

@@ -1,12 +1,10 @@
 package com.teads.summerschool.record;
 
 import com.teads.summerschool.config.BidderProperties;
-import com.teads.summerschool.creative.CreativeRepository;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.core.ReactiveRedisTemplate;
-import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Component;
 import reactor.core.publisher.Mono;
 
@@ -20,10 +18,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * Per-creative budget cache backed by Redis, plus durable market-learning stats.
  *
  * <p>Key format: {@code {bidderId}_{creativeId}_budget}, value = remaining budget.
- * Each creative has its own budget limit; remaining decreases on each Kafka-confirmed
- * win for that creative. Both this bidder and the SSP read these keys to decide whether
- * a creative can still spend. Postgres's {@code creatives.budget} column is kept in sync
- * with the same remaining value so it isn't lost if Redis is wiped.
+ * The SSP is the SINGLE OWNER of spend on these keys: it atomically decrements them
+ * on each win. This bidder never writes spend — it only seeds a key once with
+ * setIfAbsent (so a restart can't refill an already-spent budget) and reads the
+ * remaining value to decide whether a creative can still spend.
  *
  * <p>The market-learning signals that drive computeBidPrice — the recent clearing-price
  * window and the win count — are mirrored to Redis ({@code {bidderId}_win_prices} list,
@@ -36,20 +34,8 @@ public class BidderStatsCache {
 
     private static final Logger log = LoggerFactory.getLogger(BidderStatsCache.class);
 
-    // KEYS[1] = budget key, ARGV[1] = default budget (used only if the key doesn't exist yet),
-    // ARGV[2] = clearing price to subtract. Atomic on the Redis server itself, replacing the old
-    // synchronized setIfAbsent()-then-increment() pair, which only ever guarded against
-    // concurrent callers within this one JVM, not against Redis itself.
-    private static final RedisScript<Double> RECORD_WIN_SCRIPT = RedisScript.of("""
-            if redis.call('EXISTS', KEYS[1]) == 0 then
-                redis.call('SET', KEYS[1], ARGV[1])
-            end
-            return redis.call('INCRBYFLOAT', KEYS[1], -tonumber(ARGV[2]))
-            """, Double.class);
-
     private final BidderProperties properties;
     private final ReactiveRedisTemplate<String, String> redis;
-    private final CreativeRepository creativeRepository;
 
     private final AtomicLong winCount = new AtomicLong(0);
     private final Deque<Double> recentWinPrices = new ArrayDeque<>();
@@ -61,11 +47,9 @@ public class BidderStatsCache {
     // lets us bid just enough to clear the market instead of overshooting.
     private final Deque<Double> recentMarketPrices = new ArrayDeque<>();
 
-    public BidderStatsCache(BidderProperties properties, ReactiveRedisTemplate<String, String> redis,
-                             CreativeRepository creativeRepository) {
+    public BidderStatsCache(BidderProperties properties, ReactiveRedisTemplate<String, String> redis) {
         this.properties = properties;
         this.redis = redis;
-        this.creativeRepository = creativeRepository;
     }
 
     /** Redis key holding the remaining budget for one creative. */
@@ -147,38 +131,37 @@ public class BidderStatsCache {
         }
     }
 
-    /** Set a creative's remaining budget to its full limit. Called once per creative on startup. */
+    /**
+     * Seed a creative's remaining budget to its full limit, only if the key doesn't exist yet
+     * (SETNX semantics). The SSP owns spend on this key, so an unconditional SET on a bidder
+     * restart would refill an already-spent budget. Called once per creative on startup.
+     */
     public Mono<Boolean> initBudget(String creativeId, double budget) {
         String key = budgetKey(creativeId);
-        return redis.opsForValue().set(key, String.valueOf(budget))
-                .doOnNext(ok -> log.info("Creative budget initialized: {} = {}", key, budget));
+        return redis.opsForValue().setIfAbsent(key, String.valueOf(budget))
+                .doOnNext(seeded -> {
+                    if (seeded) {
+                        log.info("Creative budget seeded: {} = {}", key, budget);
+                    } else {
+                        log.info("Creative budget already exists — left untouched: {}", key);
+                    }
+                });
     }
 
-    /** Decrement the winning creative's remaining budget by what it paid. */
-    public Mono<Double> recordWin(String creativeId, double clearingPrice) {
-        String key = budgetKey(creativeId);
-        return redis.execute(RECORD_WIN_SCRIPT,
-                        List.of(key),
-                        List.of(String.valueOf(properties.getCreativeBudget()), String.valueOf(clearingPrice)))
-                .next()
-                .doOnNext(after -> log.info("BUDGET  key={} clearing={} remaining={}", key, clearingPrice, after))
-                .flatMap(after -> creativeRepository.findById(creativeId)
-                        .flatMap(c -> {
-                            c.setBudget(after);
-                            return creativeRepository.save(c);
-                        })
-                        .thenReturn(after))
-                .doOnNext(after -> {
-                    // Fast in-memory read path for the reactive bid loop.
-                    winCount.incrementAndGet();
-                    pushCapped(recentWinPrices, clearingPrice);
-                    // A win's clearing price is also a market observation.
-                    pushCapped(recentMarketPrices, clearingPrice);
-                })
-                // Durable, cross-restart/replica copy of the same signals. Best-effort: a Redis
-                // failure here must not undo the (already-committed) budget decrement, so swallow
-                // errors — the in-memory mirror above still reflects this win.
-                .flatMap(after -> recordWinStats(clearingPrice).thenReturn(after));
+    /**
+     * Record a Kafka-confirmed win in the local and durable market-learning stats. The budget
+     * key itself is NOT touched here — the SSP is the single owner of budget spend and has
+     * already decremented {@code {bidderId}_{creativeId}_budget} atomically on the win.
+     */
+    public Mono<Void> recordWin(String creativeId, double clearingPrice) {
+        // Fast in-memory read path for the reactive bid loop.
+        winCount.incrementAndGet();
+        pushCapped(recentWinPrices, clearingPrice);
+        // A win's clearing price is also a market observation.
+        pushCapped(recentMarketPrices, clearingPrice);
+        // Durable, cross-restart/replica copy of the same signals. Best-effort: errors are
+        // swallowed inside recordWinStats — the in-memory mirror above still reflects this win.
+        return recordWinStats(clearingPrice);
     }
 
     /** Persist the win to the durable Redis learning signals (win count + capped price windows). */
@@ -248,7 +231,7 @@ public class BidderStatsCache {
                 // This read is on the bid hot path. A Redis timeout/error here would otherwise
                 // propagate up and blow the request's 300ms deadline (a logged BID TIMEOUT = a lost
                 // auction). Treat a transient failure as "budget available" so we still bid; the
-                // Kafka-driven recordWin remains the source of truth for actual spend.
+                // SSP-owned budget key remains the source of truth for actual spend.
                 .onErrorResume(e -> {
                     log.warn("Budget read failed for {} — assuming full budget for this bid (non-fatal): {}",
                             key, e.getMessage());
