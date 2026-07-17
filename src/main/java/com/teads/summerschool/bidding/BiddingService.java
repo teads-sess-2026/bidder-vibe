@@ -184,13 +184,17 @@ public class BiddingService {
             double remaining = best.getValue();
 
             // Minimum-to-win selection: second-price means we pay the clearing price, so the way to
-            // avoid overpaying is to enter only auctions we can win CHEAPLY. Once we have a market
-            // estimate, skip auctions whose floor already exceeds our minimum-to-win price
-            // (market * winMargin) — those clear expensive and burn the fixed pool on few wins.
+            // avoid overpaying is to enter only auctions we can win CHEAPLY. Skip auctions whose
+            // floor already exceeds our minimum-to-win price (winClearing * winMargin).
+            // Anchor on the WIN-clearing average, not the market (win+loss) average: a win's
+            // clearing price is always a COMPETITOR's runner-up bid, never our own. The market
+            // average includes losses where WE were the runner-up (clearing price == our bid), so
+            // anchoring to it would feed our own bids back into the estimate and ratchet bids up
+            // over time even when real auction prices are flat.
             BidderProperties.Strategy s = properties.getStrategy();
-            double marketEstimate = statsCache.getRollingAverageMarketPrice();
-            if (marketEstimate > 0.0 && statsCache.getMarketSampleCount() >= s.getMinSamples()
-                    && floor > marketEstimate * s.getWinMarginMultiplier()) {
+            double winClearing = statsCache.getRollingAverageWinPrice();
+            if (winClearing > 0.0 && statsCache.getWinCount() >= s.getMinSamples()
+                    && floor > winClearing * s.getWinMarginMultiplier()) {
                 return noBid(record, "floor_too_high", start);
             }
 
@@ -261,15 +265,17 @@ public class BiddingService {
         double floor = request.floorPrice();
         BidderProperties.Strategy s = properties.getStrategy();
 
-        long total = statsCache.getWinCount() + statsCache.getLossCount();
         double floorGuard = floor * 1.01;
 
-        // Target the estimated minimum-to-win: rolling clearing price nudged up by the win margin.
-        // Before we have a market estimate (cold start), fall back to a small floor markup.
-        double market = statsCache.getRollingAverageMarketPrice();
+        // Target the estimated minimum-to-win: the average price at which we actually WIN, nudged
+        // up by the win margin. Anchor on the win-clearing average (always a competitor's runner-up
+        // bid) rather than the market average (which folds in losses where our own bid was the
+        // clearing price) — otherwise our bids feed back into the estimate and creep upward even
+        // when real auction prices are flat. Before we have enough wins, fall back to a floor markup.
+        double winClearing = statsCache.getRollingAverageWinPrice();
         double base;
-        if (market > 0.0 && total >= s.getMinSamples()) {
-            base = Math.max(floorGuard, market * s.getWinMarginMultiplier());
+        if (winClearing > 0.0 && statsCache.getWinCount() >= s.getMinSamples()) {
+            base = Math.max(floorGuard, winClearing * s.getWinMarginMultiplier());
         } else {
             base = floor * s.getColdStartMultiplier();
         }
