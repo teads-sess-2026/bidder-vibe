@@ -1,0 +1,118 @@
+{
+  "title": "Bidder Efficiency",
+  "uid": "bidder-efficiency",
+  "schemaVersion": 39,
+  "editable": true,
+  "time": { "from": "now-30m", "to": "now" },
+  "refresh": "5s",
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Total wins (score)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (bidder) ({__name__=~\".+_wins_total\"})", "legendFormat": "{{bidder}}" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Cost per win",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 9, "x": 6, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (bidder) ({__name__=~\".+_spend_total\"}) / clamp_min(sum by (bidder) ({__name__=~\".+_wins_total\"}), 1)", "legendFormat": "{{bidder}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Total spend",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 9, "x": 15, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (bidder) ({__name__=~\".+_spend_total\"})", "legendFormat": "{{bidder}}" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Budget utilization",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (bidder) ({__name__=~\".+_budget_utilization\"})", "legendFormat": "{{bidder}}" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Live win rate",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (bidder) ({__name__=~\".+_win_rate\"})", "legendFormat": "{{bidder}}" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Bid price (avg + p95)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (bidder) (rate({__name__=~\".+_bid_price_sum\"}[1m])) / clamp_min(sum by (bidder) (rate({__name__=~\".+_bid_price_count\"}[1m])), 0.0001)", "legendFormat": "avg {{bidder}}" },
+        { "refId": "B", "expr": "max by (bidder) ({__name__=~\".+_bid_price\", quantile=\"0.95\"})", "legendFormat": "p95 {{bidder}}" }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Win clearing price (avg + p95)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (bidder) (rate({__name__=~\".+_win_clearing_price_sum\"}[1m])) / clamp_min(sum by (bidder) (rate({__name__=~\".+_win_clearing_price_count\"}[1m])), 0.0001)", "legendFormat": "avg {{bidder}}" },
+        { "refId": "B", "expr": "max by (bidder) ({__name__=~\".+_win_clearing_price\", quantile=\"0.95\"})", "legendFormat": "p95 {{bidder}}" }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Pacing ratio (>1 ahead of even line)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0,
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 22 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (bidder) ({__name__=~\".+_pacing_ratio\"})", "legendFormat": "{{bidder}}" }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Bid coverage — requests vs bids / sec",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 22 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (bidder) (rate({__name__=~\".+_requests_total\"}[1m]))", "legendFormat": "requests {{bidder}}" },
+        { "refId": "B", "expr": "sum by (bidder) (rate({__name__=~\".+_bids_total\"}[1m]))", "legendFormat": "bids {{bidder}}" }
+      ]
+    }
+  ]
+}

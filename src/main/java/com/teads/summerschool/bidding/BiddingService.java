@@ -78,6 +78,11 @@ public class BiddingService {
     @PostConstruct
     void registerBudgetGauge() {
         metrics.registerGauge("budget.remaining", this::getRemainingBudgetSafe);
+        // Strategy-state gauges: live win rate, how much of the pool is spent, and whether spend is
+        // ahead of / behind the even pacing line — the efficiency signals the dashboard plots.
+        metrics.registerGauge("win.rate", this::winRateSafe);
+        metrics.registerGauge("budget.utilization", this::budgetUtilizationSafe);
+        metrics.registerGauge("pacing.ratio", this::pacingRatio);
 
         try {
             Instant resolved = statsCache.getOrInitPacingAnchor(bootInstant).block();
@@ -106,6 +111,26 @@ public class BiddingService {
         } catch (Exception ex) {
             return lastKnownBudget;
         }
+    }
+
+    /** Live win rate: wins / (wins + losses); 0 before any auction outcome is recorded. */
+    private double winRateSafe() {
+        long wins = statsCache.getWinCount();
+        long total = wins + statsCache.getLossCount();
+        return total > 0 ? (double) wins / total : 0.0;
+    }
+
+    /**
+     * Fraction of the whole budget pool spent so far (0–1). Uses the last known remaining budget
+     * (served by the gauge-safe reader, never a fresh blocking Redis read on the scrape thread) and
+     * the same pool denominator as pacing, so utilization and pacing agree on the total.
+     */
+    private double budgetUtilizationSafe() {
+        double pool = totalPacingBudget();
+        if (pool <= 0.0) return 0.0;
+        double remaining = getRemainingBudgetSafe();
+        double spent = pool - remaining;
+        return Math.max(0.0, Math.min(1.0, spent / pool));
     }
 
     public Mono<Optional<BidResponse>> bid(BidRequest request) {
@@ -181,6 +206,7 @@ public class BiddingService {
             record.setCreativeId(creative.getId());
             record.setLatencyMs(elapsedMs(start));
             metrics.recordBid();
+            metrics.recordBidPrice(bidPrice);
             metrics.recordLatency(elapsedMs(start));
 
             BidResponse response = new BidResponse(
@@ -226,39 +252,50 @@ public class BiddingService {
     }
 
     /**
-     * Efficiency-first price: estimate the market clearing price and bid just enough over it.
-     * Cold start (too few observed wins) falls back to a small markup over the floor. A pacing
-     * multiplier then scales the bid up or down to keep the creative's budget alive across the
-     * whole competition window — this is the sole price modifier. Always kept strictly above the
-     * floor and never above the creative's remaining budget.
+     * Efficiency-first price, anchored to the request FLOOR (never to our own past bids). Since the
+     * score is total wins on a fixed budget, the goal is the lowest price that still clears, so we
+     * bid a small multiple of the floor and let the observed WIN RATE decide how large that multiple
+     * is: winning easily → shave it toward the floor; losing a lot → nudge toward what losses
+     * actually cleared at, but hard-capped at a small multiple of the floor so a runaway market can
+     * never spiral the bid up to the budget cap (the old market-average feedback loop did exactly
+     * that — 20¢ → $25). A gentle pacing multiplier keeps the creative's budget alive across the
+     * window. Always kept strictly above the floor and never above the creative's remaining budget.
      */
     private double computeBidPrice(BidRequest request, PacingState pacing) {
         double floor = request.floorPrice();
         BidderProperties.Strategy s = properties.getStrategy();
 
+        long wins = statsCache.getWinCount();
+        long losses = statsCache.getLossCount();
+        long total = wins + losses;
+
         double base;
-        // Prefer the fuller market window (wins AND losses) once we have enough samples —
-        // loss clearing prices reveal what it actually costs to win, so this is a far less
-        // biased estimate than win prices alone (which only sample at/below what we already
-        // win). Fall back to the win-only average, then to cold-start, as samples thin out.
-        double marketAvg = statsCache.getMarketSampleCount() >= s.getMinSamples()
-                ? statsCache.getRollingAverageMarketPrice()
-                : (statsCache.getSampleCount() >= s.getMinSamples()
-                        ? statsCache.getRollingAverageWinPrice()
-                        : 0.0);
-        if (marketAvg <= 0.0) {
-            // Not enough observed clearing prices to trust the market signal yet.
+        if (total < s.getMinSamples()) {
+            // Cold start: not enough outcomes yet to trust a win rate — a small markup over floor.
             base = floor * s.getColdStartMultiplier();
         } else {
-            // Bid just over the observed market: low when we win easily, higher when we lose.
-            double market = Math.max(floor, marketAvg);
-            base = market * s.getMarketMultiplier();
+            double winRate = (double) wins / total;
+            if (winRate > 0.6) {
+                // Winning cheaply and often — spend even less over the floor.
+                base = floor * 1.05;
+            } else if (winRate > 0.3) {
+                // Healthy fill — a modest markup over floor.
+                base = floor * 1.10;
+            } else {
+                // Losing too much: lean toward what it actually cost to win (loss clearing prices),
+                // but CAP at a small multiple of the floor so this branch can never run away.
+                double avgLoss = statsCache.getRollingAverageLossPrice();
+                double target = avgLoss > 0.0 ? avgLoss * 1.02 : floor * 1.15;
+                base = Math.min(target, floor * 1.25);
+            }
         }
 
+        // Gentle pacing nudge only — clamped to [pacingCut, pacingBoost], so it can adjust the bid
+        // up/down to keep budget alive but never re-introduce a large upward push.
         base *= pacingMultiplier(pacing);
 
         // Never overspend a creative in a single win, but always stay strictly above the floor.
-        double floorGuard = floor * 1.15;
+        double floorGuard = floor * 1.05;
         double capped = Math.min(base, Math.max(pacing.remainingBudget(), floorGuard));
         double price = Math.max(capped, floorGuard);
         // Round to 4 dp; re-guard in case rounding nudged us to the floor.
@@ -340,11 +377,28 @@ public class BiddingService {
      */
     private boolean shouldBid() {
         double elapsedFraction = pacingState(0).elapsedFraction();
-        int creativeCount = budgetSnapshot.isEmpty() ? 200 : budgetSnapshot.size();
-        double totalBudget = properties.getCreativeBudget() * creativeCount;
-        double expectedSpend = elapsedFraction * totalBudget;
+        double expectedSpend = elapsedFraction * totalPacingBudget();
         double actualSpend = totalSpentCents.get() / 100.0;
         return actualSpend < expectedSpend * PACING_TOLERANCE;
+    }
+
+    /** Total budget pool used as the pacing denominator: creative budget × live creative count. */
+    private double totalPacingBudget() {
+        int creativeCount = budgetSnapshot.isEmpty() ? 200 : budgetSnapshot.size();
+        return properties.getCreativeBudget() * creativeCount;
+    }
+
+    /**
+     * How our actual cleared spend compares to the EVEN target spend for this point in the window:
+     * {@code actualSpend / expectedEvenSpend}. >1 means we are ahead of the even line, <1 behind.
+     * Shares {@link #totalPacingBudget()} with {@link #shouldBid()} so the gauge and the gate agree.
+     * Returns 0 before any spend is expected yet (pre-window), where "ahead/behind" is undefined.
+     */
+    private double pacingRatio() {
+        double elapsedFraction = pacingState(0).elapsedFraction();
+        double expectedSpend = elapsedFraction * totalPacingBudget();
+        double actualSpend = totalSpentCents.get() / 100.0;
+        return expectedSpend <= 0.0 ? 0.0 : actualSpend / expectedSpend;
     }
 
     private double pacingMultiplier(PacingState p) {

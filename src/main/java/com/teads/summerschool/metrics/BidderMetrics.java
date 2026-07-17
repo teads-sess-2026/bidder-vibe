@@ -2,6 +2,7 @@ package com.teads.summerschool.metrics;
 
 import com.teads.summerschool.config.BidderProperties;
 import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.DistributionSummary;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
@@ -24,6 +25,10 @@ public class BidderMetrics {
     private final Counter losses;
     private final Counter spend;
     private final Timer bidLatency;
+    // Price distributions (avg + p50/p95) so we can watch that bids stay a small multiple of the
+    // floor and never creep back toward the $25 budget cap, and see what wins actually clear at.
+    private final DistributionSummary bidPrice;
+    private final DistributionSummary winClearingPrice;
 
     private final String prefix;
 
@@ -46,6 +51,12 @@ public class BidderMetrics {
                 .description("Total clearing price paid").register(registry);
         this.bidLatency = Timer.builder(prefix + "bid.latency")
                 .description("Bid handling latency").register(registry);
+        this.bidPrice = DistributionSummary.builder(prefix + "bid.price")
+                .description("Submitted bid price").baseUnit("usd")
+                .publishPercentiles(0.5, 0.95).register(registry);
+        this.winClearingPrice = DistributionSummary.builder(prefix + "win.clearing.price")
+                .description("Clearing price actually paid on wins").baseUnit("usd")
+                .publishPercentiles(0.5, 0.95).register(registry);
     }
 
     public void recordRequest() { requests.increment(); }
@@ -65,8 +76,16 @@ public class BidderMetrics {
 
     public void recordLoss() { losses.increment(); }
 
+    /** Record the price we bid (populates the bid-price distribution). */
+    public void recordBidPrice(double price) { bidPrice.record(price); }
+
+    /** Record the clearing price actually paid on a confirmed win. */
+    public void recordWinClearingPrice(double clearingPrice) { winClearingPrice.record(clearingPrice); }
+
     /** Register a live gauge (e.g. remaining budget); the group prefix is applied. */
     public void registerGauge(String name, Supplier<Number> supplier) {
         Gauge.builder(prefix + name, supplier).register(registry);
     }
+
+    
 }

@@ -40,12 +40,21 @@ public class BidderStatsCache {
     private final AtomicLong winCount = new AtomicLong(0);
     private final Deque<Double> recentWinPrices = new ArrayDeque<>();
 
+    // Count of auctions we bid on but LOST. Together with winCount this gives the live win rate
+    // the floor-anchored pricing uses to decide how far over the floor to bid.
+    private final AtomicLong lossCount = new AtomicLong(0);
+
     // The observed *market* price window: clearing prices from auctions we won AND lost.
     // Loss clearing prices are the market signal the bidder was previously blind to — they
     // tell us what it cost to win auctions we didn't, so pricing off this fuller window
     // (rather than win prices alone, which only ever sample at/below what we already win)
     // lets us bid just enough to clear the market instead of overshooting.
     private final Deque<Double> recentMarketPrices = new ArrayDeque<>();
+
+    // Loss-only clearing-price window: exactly what it cost to win auctions we DIDN'T. Pricing's
+    // "losing too much" branch nudges toward this (capped), so it must stay loss-only — mixing in
+    // the cheaper win prices would drag the average down and push our bid the wrong way.
+    private final Deque<Double> recentLossPrices = new ArrayDeque<>();
 
     public BidderStatsCache(BidderProperties properties, ReactiveRedisTemplate<String, String> redis) {
         this.properties = properties;
@@ -70,6 +79,16 @@ public class BidderStatsCache {
     /** Redis key holding the capped list of recent market clearing prices (wins + losses). */
     private String marketPricesKey() {
         return properties.getId() + "_market_prices";
+    }
+
+    /** Redis key holding the capped list of recent LOSS clearing prices. */
+    private String lossPricesKey() {
+        return properties.getId() + "_loss_prices";
+    }
+
+    /** Redis key holding this bidder's cumulative loss count. */
+    private String lossCountKey() {
+        return properties.getId() + "_loss_count";
     }
 
     /** Redis key holding the pacing anchor — the instant this bidder first started spending. */
@@ -124,8 +143,33 @@ public class BidderStatsCache {
                     }
                 }
             }
-            log.info("Warm-loaded market stats from Redis: winCount={} winPriceSamples={} marketPriceSamples={}",
-                    winCount.get(), recentWinPrices.size(), recentMarketPrices.size());
+            Long losses = redis.opsForValue().get(lossCountKey())
+                    .map(Long::parseLong)
+                    .onErrorReturn(0L)
+                    .block();
+            if (losses != null) {
+                lossCount.set(losses);
+            }
+            List<String> lossPrices = redis.opsForList().range(lossPricesKey(), 0, -1)
+                    .collectList()
+                    .onErrorReturn(List.of())
+                    .block();
+            if (lossPrices != null && !lossPrices.isEmpty()) {
+                synchronized (recentLossPrices) {
+                    recentLossPrices.clear();
+                    for (String p : lossPrices) {
+                        try {
+                            recentLossPrices.addLast(Double.parseDouble(p));
+                        } catch (NumberFormatException ignored) {
+                            // Skip a malformed entry rather than abort the whole warm-load.
+                        }
+                    }
+                }
+            }
+            log.info("Warm-loaded market stats from Redis: winCount={} winPriceSamples={} "
+                            + "marketPriceSamples={} lossCount={} lossPriceSamples={}",
+                    winCount.get(), recentWinPrices.size(), recentMarketPrices.size(),
+                    lossCount.get(), recentLossPrices.size());
         } catch (Exception e) {
             log.warn("Market-stats warm-load skipped (non-fatal): {}", e.getMessage());
         }
@@ -188,12 +232,25 @@ public class BidderStatsCache {
      * Safe to call from the Kafka consumer thread.
      */
     public Mono<Void> recordLoss(double clearingPrice) {
+        lossCount.incrementAndGet();
         pushCapped(recentMarketPrices, clearingPrice);
-        return pushMarketPriceRedis(clearingPrice)
+        pushCapped(recentLossPrices, clearingPrice);
+        return recordLossStats(clearingPrice)
                 .onErrorResume(e -> {
                     log.warn("Durable loss-price update failed (non-fatal): {}", e.getMessage());
                     return Mono.empty();
                 });
+    }
+
+    /** Persist the loss to the durable Redis learning signals (loss count + loss/market windows). */
+    private Mono<Void> recordLossStats(double clearingPrice) {
+        int windowSize = properties.getStrategy().getWindowSize();
+        return redis.opsForValue().increment(lossCountKey())
+                .then(redis.opsForList().rightPush(lossPricesKey(), String.valueOf(clearingPrice)))
+                .then(redis.opsForList().trim(lossPricesKey(), -windowSize, -1))
+                // A loss clearing price is also a market observation.
+                .then(pushMarketPriceRedis(clearingPrice))
+                .then();
     }
 
     /** Append a market clearing price to the durable Redis window, trimmed to windowSize. */
@@ -293,5 +350,15 @@ public class BidderStatsCache {
 
     public long getSampleCount() {
         return winCount.get();
+    }
+
+    /** Number of auctions we bid on but lost. */
+    public long getLossCount() {
+        return lossCount.get();
+    }
+
+    /** Rolling average of recent LOSS clearing prices — what it cost to win auctions we didn't. */
+    public double getRollingAverageLossPrice() {
+        return averageOf(recentLossPrices);
     }
 }

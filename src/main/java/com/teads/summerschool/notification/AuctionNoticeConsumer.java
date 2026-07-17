@@ -68,6 +68,11 @@ public class AuctionNoticeConsumer {
                 // dedicated Kafka consumer thread, not the Netty event loop.
                 double clearingPrice = notice.getClearingPrice();
                 metrics.recordWin(clearingPrice);
+                metrics.recordWinClearingPrice(clearingPrice);
+                // Feed the win into the durable market-learning stats so winCount (and thus the
+                // live win rate the floor-anchored pricing reads) is real — previously only the
+                // metrics counter moved, leaving statsCache.winCount stuck at 0.
+                statsCache.recordWin(ourBid.creativeId(), clearingPrice).block();
                 // Feed live cleared spend into the bidder's linear pacing tracker.
                 biddingService.recordSpend(clearingPrice);
                 winNoticeRepository.save(new WinNotice(
