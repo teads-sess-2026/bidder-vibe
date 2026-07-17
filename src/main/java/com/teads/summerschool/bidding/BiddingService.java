@@ -159,13 +159,15 @@ public class BiddingService {
             // F2: only creatives that still have budget. Read the in-memory budget snapshot
             // (refreshed ~1s off the event loop) instead of one Redis GET per matched creative on
             // the hot path — a synchronous O(1) lookup. A missing key defaults to the full budget
-            // so a cold/empty snapshot never wrongly no-bids; a small floor (> 5) skips creatives
-            // that are effectively drained.
+            // so a cold/empty snapshot never wrongly no-bids. A creative stays eligible as long as
+            // it can still afford this auction (> max(floor, minCreativeBudget)), so we don't
+            // strand near-empty creatives at window end.
             Map<String, Double> budgets = getBudgetSnapshot();
             double full = properties.getCreativeBudget();
+            double minCreativeBudget = Math.max(floor, properties.getStrategy().getMinCreativeBudget());
             List<Map.Entry<Creative, Double>> eligible = matched.stream()
                     .map(c -> Map.entry(c, budgets.getOrDefault(c.getId(), full)))
-                    .filter(e -> e.getValue() > 5.0)
+                    .filter(e -> e.getValue() > minCreativeBudget)
                     .toList();
             if (eligible.isEmpty()) {
                 return noBid(record, "budget_exhausted", start);
@@ -180,6 +182,17 @@ public class BiddingService {
                     .orElseThrow();
             Creative creative = best.getKey();
             double remaining = best.getValue();
+
+            // Minimum-to-win selection: second-price means we pay the clearing price, so the way to
+            // avoid overpaying is to enter only auctions we can win CHEAPLY. Once we have a market
+            // estimate, skip auctions whose floor already exceeds our minimum-to-win price
+            // (market * winMargin) — those clear expensive and burn the fixed pool on few wins.
+            BidderProperties.Strategy s = properties.getStrategy();
+            double marketEstimate = statsCache.getRollingAverageMarketPrice();
+            if (marketEstimate > 0.0 && statsCache.getMarketSampleCount() >= s.getMinSamples()
+                    && floor > marketEstimate * s.getWinMarginMultiplier()) {
+                return noBid(record, "floor_too_high", start);
+            }
 
             // Linear pacing: skip only when we are running ahead of the EVEN target spend line for
             // this point in the window (see shouldBid). Unlike the old back-loaded throttle, this
@@ -240,31 +253,26 @@ public class BiddingService {
     }
 
    /*
-   bid stritcly above the floor by a base multiplier and
-   get from the cache the market price
+   Minimum-to-win pricing: aim just above the rolling clearing price so we win the cheap
+   auctions selected upstream without overpaying. In a second-price auction we pay the
+   runner-up's bid, so there is no reason to price off the floor.
     */
     private double computeBidPrice(BidRequest request, PacingState pacing) {
         double floor = request.floorPrice();
         BidderProperties.Strategy s = properties.getStrategy();
 
         long total = statsCache.getWinCount() + statsCache.getLossCount();
-
-        // Flat markup over the floor: cold-start markup until we have enough outcomes, then the
-        // steady-state market-multiplier. No win-rate branching — never escalate on losses.
-        double base = floor * (total < s.getMinSamples()
-                ? s.getColdStartMultiplier()
-                : s.getMarketMultiplier());
-
-        // Hard cap at what the market actually clears at (wins + losses window). Once we have a
-        // market estimate, never bid above it — bidding higher than the clearing price only wins
-        // auctions we'd have won anyway, at a worse price. Floor-guarded so the cap can't sink us
-        // to/under the floor when the observed market is unusually cheap.
         double floorGuard = floor * 1.01;
-        double market = statsCache.getRollingAverageMarketPrice();
-        if (market > 0.0) {
-            base = Math.min(base, Math.max(floorGuard, market));
-        }
 
+        // Target the estimated minimum-to-win: rolling clearing price nudged up by the win margin.
+        // Before we have a market estimate (cold start), fall back to a small floor markup.
+        double market = statsCache.getRollingAverageMarketPrice();
+        double base;
+        if (market > 0.0 && total >= s.getMinSamples()) {
+            base = Math.max(floorGuard, market * s.getWinMarginMultiplier());
+        } else {
+            base = floor * s.getColdStartMultiplier();
+        }
 
         base *= pacingMultiplier(pacing);
 
@@ -276,15 +284,11 @@ public class BiddingService {
         return price <= floor ? floorGuard : price;
     }
 
-    
+
     private record PacingState(double elapsedFraction, double spentFraction, double remainingBudget) {}
 
     private PacingState pacingState(double remainingBudget) {
         BidderProperties.Competition comp = properties.getCompetition();
-        /* Resolve the pacing start: an explicit competition.start-time wins; otherwise fall back
-         to the persisted pacing anchor (Redis-backed boot instant). Pacing is therefore always
-        active — a blank or unparseable start-time no longer silently disables it.
-        */
         Instant startTime;
         String configured = comp.getStartTime();
         if (configured != null && !configured.isBlank()) {
@@ -346,7 +350,11 @@ public class BiddingService {
         if (pace >= 1.0) {
             return true;
         }
-        return random.nextDouble() < pace * pace;
+        // Linear entry (not squared) so we enter far more auctions when only slightly behind the
+        // spend line, with a floor so we never fully stall. Minimum-to-win pricing keeps each win
+        // cheap, so budget drains slowly and pace stays >= 1 (full entry) most of the window.
+        double prob = Math.max(properties.getStrategy().getMinEnterProbability(), pace);
+        return random.nextDouble() < prob;
     }
 
     /** Total budget pool used as the pacing denominator: creative budget × live creative count. */

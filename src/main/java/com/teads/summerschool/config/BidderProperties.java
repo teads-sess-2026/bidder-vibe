@@ -51,6 +51,18 @@ public class BidderProperties {
 
         private double throttleMaxSkip = 0.95;
 
+        // Minimum-to-win pricing: bid this multiple of the rolling clearing price — just enough
+        // to win the cheaper-than-average auctions without overpaying. Also gates auction entry:
+        // skip auctions whose floor already exceeds this estimated minimum-to-win price.
+        private double winMarginMultiplier = 1.05;
+
+        // Floor on per-auction entry probability when behind the spend pace (see shouldBid).
+        private double minEnterProbability = 0.25;
+
+        // Keep a creative eligible while it can still afford the current auction, instead of
+        // benching it once it drops below a flat $5 — avoids stranding budget at window end.
+        private double minCreativeBudget = 0.5;
+
         public int getMinSamples() { return minSamples; }
         public void setMinSamples(int minSamples) { this.minSamples = minSamples; }
 
@@ -86,6 +98,15 @@ public class BidderProperties {
 
         public double getThrottleMaxSkip() { return throttleMaxSkip; }
         public void setThrottleMaxSkip(double throttleMaxSkip) { this.throttleMaxSkip = throttleMaxSkip; }
+
+        public double getWinMarginMultiplier() { return winMarginMultiplier; }
+        public void setWinMarginMultiplier(double winMarginMultiplier) { this.winMarginMultiplier = winMarginMultiplier; }
+
+        public double getMinEnterProbability() { return minEnterProbability; }
+        public void setMinEnterProbability(double minEnterProbability) { this.minEnterProbability = minEnterProbability; }
+
+        public double getMinCreativeBudget() { return minCreativeBudget; }
+        public void setMinCreativeBudget(double minCreativeBudget) { this.minCreativeBudget = minCreativeBudget; }
     }
 
     public static class Competition {
