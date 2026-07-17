@@ -76,8 +76,12 @@ public class BidderMetrics {
 
     public void recordLoss() { losses.increment(); }
 
-    /** Record the price we bid (populates the bid-price distribution). */
+
     public void recordBidPrice(double price) { bidPrice.record(price); }
+
+    public void recordBidWin(double price){
+        winClearingPrice.record(price);
+    }
 
     /** Record the clearing price actually paid on a confirmed win. */
     public void recordWinClearingPrice(double clearingPrice) { winClearingPrice.record(clearingPrice); }

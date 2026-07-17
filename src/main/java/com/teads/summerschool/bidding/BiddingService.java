@@ -53,8 +53,7 @@ public class BiddingService {
 
     private final java.util.concurrent.atomic.AtomicLong totalSpentCents = new java.util.concurrent.atomic.AtomicLong(0);
 
-
-    private static final double PACING_TOLERANCE = 1.50;
+    private final java.util.Random random = new java.util.Random();
 
     // Persist ~1 in RECORD_SAMPLE_RATE bid records to Postgres (see saveRecordAsync) — cuts DB
     // write load ~10x while keeping dashboard aggregates representative.
@@ -78,8 +77,6 @@ public class BiddingService {
     @PostConstruct
     void registerBudgetGauge() {
         metrics.registerGauge("budget.remaining", this::getRemainingBudgetSafe);
-        // Strategy-state gauges: live win rate, how much of the pool is spent, and whether spend is
-        // ahead of / behind the even pacing line — the efficiency signals the dashboard plots.
         metrics.registerGauge("win.rate", this::winRateSafe);
         metrics.registerGauge("budget.utilization", this::budgetUtilizationSafe);
         metrics.registerGauge("pacing.ratio", this::pacingRatio);
@@ -120,11 +117,6 @@ public class BiddingService {
         return total > 0 ? (double) wins / total : 0.0;
     }
 
-    /**
-     * Fraction of the whole budget pool spent so far (0–1). Uses the last known remaining budget
-     * (served by the gauge-safe reader, never a fresh blocking Redis read on the scrape thread) and
-     * the same pool denominator as pacing, so utilization and pacing agree on the total.
-     */
     private double budgetUtilizationSafe() {
         double pool = totalPacingBudget();
         if (pool <= 0.0) return 0.0;
@@ -211,10 +203,7 @@ public class BiddingService {
 
             BidResponse response = new BidResponse(
                     request.requestId(), bidPrice, toCreativeDto(creative));
-            // Persist the bid record OFF the response path: the SSP response must not wait
-            // on a Postgres INSERT (a shared DB under load was our biggest latency/timeout
-            // source). Fire-and-forget on the DB scheduler; a write failure is logged, not
-            // surfaced to the auction.
+            //Dont wait on a db insert and forget on db scheduler
             saveRecordAsync(record);
             return Mono.just(Optional.of(response));
     }
@@ -225,8 +214,7 @@ public class BiddingService {
         record.setLatencyMs(elapsedMs(start));
         metrics.recordNoBid(reason);
         metrics.recordLatency(elapsedMs(start));
-        // As with a bid, keep the Postgres write off the response path — even 204s were paying a full
-        // INSERT round trip before responding.
+
         saveRecordAsync(record);
         return Mono.just(Optional.empty());
     }
@@ -251,51 +239,36 @@ public class BiddingService {
                         e -> log.warn("Async bid-record save failed (non-fatal): {}", e.getMessage()));
     }
 
-    /**
-     * Efficiency-first price, anchored to the request FLOOR (never to our own past bids). Since the
-     * score is total wins on a fixed budget, the goal is the lowest price that still clears, so we
-     * bid a small multiple of the floor and let the observed WIN RATE decide how large that multiple
-     * is: winning easily → shave it toward the floor; losing a lot → nudge toward what losses
-     * actually cleared at, but hard-capped at a small multiple of the floor so a runaway market can
-     * never spiral the bid up to the budget cap (the old market-average feedback loop did exactly
-     * that — 20¢ → $25). A gentle pacing multiplier keeps the creative's budget alive across the
-     * window. Always kept strictly above the floor and never above the creative's remaining budget.
-     */
+   /*
+   bid stritcly above the floor by a base multiplier and
+   get from the cache the market price
+    */
     private double computeBidPrice(BidRequest request, PacingState pacing) {
         double floor = request.floorPrice();
         BidderProperties.Strategy s = properties.getStrategy();
 
-        long wins = statsCache.getWinCount();
-        long losses = statsCache.getLossCount();
-        long total = wins + losses;
+        long total = statsCache.getWinCount() + statsCache.getLossCount();
 
-        double base;
-        if (total < s.getMinSamples()) {
-            // Cold start: not enough outcomes yet to trust a win rate — a small markup over floor.
-            base = floor * s.getColdStartMultiplier();
-        } else {
-            double winRate = (double) wins / total;
-            if (winRate > 0.6) {
-                // Winning cheaply and often — spend even less over the floor.
-                base = floor * 1.05;
-            } else if (winRate > 0.3) {
-                // Healthy fill — a modest markup over floor.
-                base = floor * 1.10;
-            } else {
-                // Losing too much: lean toward what it actually cost to win (loss clearing prices),
-                // but CAP at a small multiple of the floor so this branch can never run away.
-                double avgLoss = statsCache.getRollingAverageLossPrice();
-                double target = avgLoss > 0.0 ? avgLoss * 1.02 : floor * 1.15;
-                base = Math.min(target, floor * 1.25);
-            }
+        // Flat markup over the floor: cold-start markup until we have enough outcomes, then the
+        // steady-state market-multiplier. No win-rate branching — never escalate on losses.
+        double base = floor * (total < s.getMinSamples()
+                ? s.getColdStartMultiplier()
+                : s.getMarketMultiplier());
+
+        // Hard cap at what the market actually clears at (wins + losses window). Once we have a
+        // market estimate, never bid above it — bidding higher than the clearing price only wins
+        // auctions we'd have won anyway, at a worse price. Floor-guarded so the cap can't sink us
+        // to/under the floor when the observed market is unusually cheap.
+        double floorGuard = floor * 1.01;
+        double market = statsCache.getRollingAverageMarketPrice();
+        if (market > 0.0) {
+            base = Math.min(base, Math.max(floorGuard, market));
         }
 
-        // Gentle pacing nudge only — clamped to [pacingCut, pacingBoost], so it can adjust the bid
-        // up/down to keep budget alive but never re-introduce a large upward push.
+
         base *= pacingMultiplier(pacing);
 
         // Never overspend a creative in a single win, but always stay strictly above the floor.
-        double floorGuard = floor * 1.05;
         double capped = Math.min(base, Math.max(pacing.remainingBudget(), floorGuard));
         double price = Math.max(capped, floorGuard);
         // Round to 4 dp; re-guard in case rounding nudged us to the floor.
@@ -303,19 +276,15 @@ public class BiddingService {
         return price <= floor ? floorGuard : price;
     }
 
-    /**
-     * A snapshot of where we are against the pacing plan for one bid: how far into the window we
-     * are, how much budget we have already spent, and the remaining budget of the chosen creative.
-     * The back-loaded target-spend curve and both pacing controls (price multiplier + throttle)
-     * are derived from this, so they always agree on the same elapsed/spent view.
-     */
+    
     private record PacingState(double elapsedFraction, double spentFraction, double remainingBudget) {}
 
     private PacingState pacingState(double remainingBudget) {
         BidderProperties.Competition comp = properties.getCompetition();
-        // Resolve the pacing start: an explicit competition.start-time wins; otherwise fall back
-        // to the persisted pacing anchor (Redis-backed boot instant). Pacing is therefore always
-        // active — a blank or unparseable start-time no longer silently disables it.
+        /* Resolve the pacing start: an explicit competition.start-time wins; otherwise fall back
+         to the persisted pacing anchor (Redis-backed boot instant). Pacing is therefore always
+        active — a blank or unparseable start-time no longer silently disables it.
+        */
         Instant startTime;
         String configured = comp.getStartTime();
         if (configured != null && !configured.isBlank()) {
@@ -337,18 +306,12 @@ public class BiddingService {
         return new PacingState(elapsedFraction, spentFraction, remainingBudget);
     }
 
-    /** Back-loaded target spend at this point in the window: elapsedFraction ^ curveExponent. */
+
     private double targetSpent(double elapsedFraction) {
         return Math.pow(elapsedFraction, properties.getStrategy().getPacingCurveExponent());
     }
 
-    /**
-     * Per-creative remaining-budget snapshot for the bid hot path. Refreshed at most once per
-     * second, and the refresh runs OFF the event loop (subscribed on the bounded-elastic scheduler)
-     * so a bid never blocks on Redis — it always reads the current, possibly-stale, snapshot
-     * synchronously. On a refresh failure the previous snapshot is retained. lastBudgetFetch is
-     * stamped before dispatching so only one refresh is ever in flight at a time.
-     */
+
     private Map<String, Double> getBudgetSnapshot() {
         long now = System.currentTimeMillis();
         if (now - lastBudgetFetch > 1000) {
@@ -368,18 +331,22 @@ public class BiddingService {
         totalSpentCents.addAndGet((long) (amount * 100));
     }
 
-    /**
-     * Linear pacing gate: bid only while our actual cleared spend is below the EVEN target spend
-     * for the elapsed fraction of the competition window (times a small tolerance so we stay
-     * mildly ahead). This spreads spend across the whole window — a steady fill — rather than
-     * banking budget for the endgame. Elapsed fraction reuses the existing pacing anchor/start-time
-     * resolution via pacingState().
-     */
+
     private boolean shouldBid() {
         double elapsedFraction = pacingState(0).elapsedFraction();
-        double expectedSpend = elapsedFraction * totalPacingBudget();
-        double actualSpend = totalSpentCents.get() / 100.0;
-        return actualSpend < expectedSpend * PACING_TOLERANCE;
+        double timeRemainingFraction = Math.max(0.01, 1.0 - elapsedFraction);
+
+        double pool = totalPacingBudget();
+        double remaining = budgetSnapshot.isEmpty()
+                ? pool
+                : budgetSnapshot.values().stream().mapToDouble(Double::doubleValue).sum();
+        double budgetRemainingFraction = pool <= 0.0 ? 1.0 : remaining / pool;
+
+        double pace = budgetRemainingFraction / timeRemainingFraction;
+        if (pace >= 1.0) {
+            return true;
+        }
+        return random.nextDouble() < pace * pace;
     }
 
     /** Total budget pool used as the pacing denominator: creative budget × live creative count. */
