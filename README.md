@@ -1,5 +1,5 @@
 # Bidder Template
-
+Changes made to check
 Spring Boot bidder skeleton for Summer School 2026.
 
 ## What to implement
