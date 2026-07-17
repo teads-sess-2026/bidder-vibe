@@ -4,7 +4,7 @@ import { provideRouter, withComponentInputBinding } from '@angular/router';
 import { provideHttpClient } from '@angular/common/http';
 import { routes } from './app.routes';
 
-export const NOTES_BASE_URL = `${environment.backendBaseUrl}/api/notes`;
+export const API_BASE_URL = `${environment.backendBaseUrl}/api`;
 
 export const appConfig: ApplicationConfig = {
     providers: [

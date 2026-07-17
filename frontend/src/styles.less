@@ -32,3 +32,29 @@ textarea {
         outline: 1px solid var(--color-border-active);
     }
 }
+
+.sess-table {
+    border-collapse: collapse;
+    width: 100%;
+
+    th,
+    td {
+        border: 1px solid var(--color-border);
+        padding: var(--spacing-small);
+        text-align: left;
+    }
+
+    thead th {
+        background-color: var(--color-hover);
+    }
+
+    .sess-table__empty {
+        text-align: center;
+        color: var(--color-text-light);
+    }
+}
+
+.sess-loading {
+    color: var(--color-text-light);
+    padding: var(--spacing-huge);
+}

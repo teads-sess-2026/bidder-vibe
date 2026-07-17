@@ -1,10 +1,14 @@
 import { Routes } from '@angular/router';
-import {NoteView} from "./views/note/note.view";
-import {AboutView} from "./views/about/about.view";
-import {HomeView} from "./views/home/home.view";
+import { OverviewView } from "./views/overview/overview.view";
+import { CreativesView } from "./views/creatives/creatives.view";
+import { TargetingView } from "./views/targeting/targeting.view";
+import { TrendsView } from "./views/trends/trends.view";
+import { AboutView } from "./views/about/about.view";
 
 export const routes: Routes = [
-    { path: 'note/:id', component: NoteView },
+    { path: '', component: OverviewView },
+    { path: 'creatives', component: CreativesView },
+    { path: 'targeting', component: TargetingView },
+    { path: 'trends', component: TrendsView },
     { path: 'about', component: AboutView },
-    { path: '', component: HomeView }
 ];

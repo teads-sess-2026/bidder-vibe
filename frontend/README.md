@@ -1,5 +1,12 @@
 # SESS-Frontend
-Finally i found the bug
+
+A starter dashboard that connects to a bidder's **Stats API** and displays its performance
+(overview KPIs, per-creative breakdown, targeting results, and recent trends). Fork this repo
+and point it at your own bidder to build on top of it.
+
+Set the bidder URL (`backendBaseUrl`) in the environment files — see [Set backend URL](#set-backend-url).
+The API is documented in [`STATS_API.md`](https://github.com/teads-sess-2026/bidder/blob/main/STATS_API.md).
+
 ## Prerequisites
 - npm v11+
 - Node v22.22.3+ (or v24.15+ / v26+) — required by Angular 22

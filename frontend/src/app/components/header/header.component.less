@@ -15,7 +15,7 @@
         font-size: min(2em, 8vw);
 
         &::before {
-            content: '📝';
+            content: '📊';
             font-size: var(--font-size-icon);
             margin-right: var(--spacing-small);
         }
@@ -36,6 +36,11 @@
             &:first-child {
                 margin-left: 0;
             }
+        }
+
+        .sess-header__link--active {
+            font-weight: bold;
+            border-bottom: 2px solid var(--color-border-active);
         }
     }
 
