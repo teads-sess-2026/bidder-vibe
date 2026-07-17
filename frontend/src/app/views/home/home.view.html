@@ -1,0 +1,14 @@
+<a routerLink="/note/new">
+    <div class="sess-home-view__note-preview sess-home-view__note-create">
+        <h1>+</h1>
+        Create new note
+    </div>
+</a>
+@for(note of notes.value(); track note.id) {
+    <a routerLink="/note/{{note.id}}">
+        <div class="sess-home-view__note-preview">
+            <h2>{{note.title}}</h2>
+            <textarea readonly class="sess-home-view__note-text" [ngModel]="note.text"></textarea>
+        </div>
+    </a>
+}

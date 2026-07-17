@@ -1,0 +1,51 @@
+:host {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    padding: var(--spacing-small);
+    gap: var(--spacing-huge);
+    flex-wrap: wrap;
+
+    .sess-home-view__note-create {
+        align-items: center;
+        justify-content: center;
+        font-size: 24px;
+        color: var(--color-text-lighter);
+
+        h1 {
+            font-size: 48px;
+            margin: -30px 0 0 0;
+        }
+    }
+
+    .sess-home-view__note-preview {
+        height: 400px;
+        max-height: 30vh;
+        min-height: 200px;
+        border: 1px solid var(--color-border);
+        border-radius: var(--spacing-huge);
+        padding: var(--spacing-huge);
+        display: flex;
+        flex-direction: column;
+        cursor: pointer;
+
+        &:hover {
+            background-color: var(--color-hover);
+        }
+
+        h2 {
+            margin: 0 0 var(--spacing-small) 0;
+            border-bottom: 1px solid var(--color-border);
+        }
+
+        .sess-home-view__note-text {
+            resize: none;
+            border: none;
+            background-color: transparent;
+            padding: 0;
+            flex-grow: 1;
+            font: inherit;
+            outline: none;
+            cursor: inherit;
+        }
+    }
+}
