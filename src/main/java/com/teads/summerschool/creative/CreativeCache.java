@@ -40,7 +40,7 @@ public class CreativeCache {
 
     // Refresh interval for the in-memory catalog snapshot below. The catalog is effectively static
     // after seeding, so a long interval keeps background Redis reads rare.
-    private static final long MEM_REFRESH_MS = 30_000;
+    private static final long MEM_REFRESH_MS = 15_000;
 
     // In-memory catalog snapshot read synchronously on the bid hot path — no Redis GET and no
     // 200-creative JSON deserialize per bid. Refreshed at most every MEM_REFRESH_MS off the event
