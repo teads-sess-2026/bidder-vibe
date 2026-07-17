@@ -1,5 +1,5 @@
 # SESS-Frontend
-
+Finally i found the bug
 ## Prerequisites
 - npm v11+
 - Node v22.22.3+ (or v24.15+ / v26+) — required by Angular 22
