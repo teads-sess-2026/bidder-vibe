@@ -1,5 +1,6 @@
 package com.teads.summerschool.notification;
 
+import com.teads.summerschool.bidding.BiddingService;
 import com.teads.summerschool.config.BidderProperties;
 import com.teads.summerschool.metrics.BidderMetrics;
 import com.teads.summerschool.proto.AuctionNoticeProto;
@@ -7,6 +8,7 @@ import com.teads.summerschool.record.BidderStatsCache;
 import com.teads.summerschool.record.OwnBidCache;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
 
@@ -20,17 +22,20 @@ public class AuctionNoticeConsumer {
     private final BidderStatsCache statsCache;
     private final BidderMetrics metrics;
     private final OwnBidCache ownBidCache;
+    private final BiddingService biddingService;
 
     public AuctionNoticeConsumer(WinNoticeRepository winNoticeRepository,
                                  BidderProperties properties,
                                  BidderStatsCache statsCache,
                                  BidderMetrics metrics,
-                                 OwnBidCache ownBidCache) {
+                                 OwnBidCache ownBidCache,
+                                 @Lazy BiddingService biddingService) {
         this.winNoticeRepository = winNoticeRepository;
         this.properties = properties;
         this.statsCache = statsCache;
         this.metrics = metrics;
         this.ownBidCache = ownBidCache;
+        this.biddingService = biddingService;
     }
 
     @KafkaListener(topics = "${kafka.topic.auction-notifications}",
@@ -63,6 +68,8 @@ public class AuctionNoticeConsumer {
                 // dedicated Kafka consumer thread, not the Netty event loop.
                 double clearingPrice = notice.getClearingPrice();
                 metrics.recordWin(clearingPrice);
+                // Feed live cleared spend into the bidder's linear pacing tracker.
+                biddingService.recordSpend(clearingPrice);
                 winNoticeRepository.save(new WinNotice(
                         notice.getRequestId(),
                         properties.getId(),

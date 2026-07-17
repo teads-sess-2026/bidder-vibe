@@ -40,15 +40,26 @@ public class BiddingService {
     private final BidderMetrics metrics;
     private final OwnBidCache ownBidCache;
 
-    // Last successfully computed budget.remaining, served when a scrape's
-    // computation times out instead of blocking the scrape thread forever.
     private volatile double lastKnownBudget = 0.0;
 
-    // When this JVM started, the fallback pacing anchor if none is configured or persisted yet.
+
     private final Instant bootInstant = Instant.now();
-    // The resolved pacing anchor (persisted in Redis, so stable across restarts). Set once at
-    // startup in registerBudgetGauge(); used by pacingMultiplier when no explicit start-time is set.
     private volatile Instant pacingAnchor = bootInstant;
+
+
+    private volatile Map<String, Double> budgetSnapshot = new java.util.concurrent.ConcurrentHashMap<>();
+    private volatile long lastBudgetFetch = 0;
+
+
+    private final java.util.concurrent.atomic.AtomicLong totalSpentCents = new java.util.concurrent.atomic.AtomicLong(0);
+
+
+    private static final double PACING_TOLERANCE = 1.50;
+
+    // Persist ~1 in RECORD_SAMPLE_RATE bid records to Postgres (see saveRecordAsync) — cuts DB
+    // write load ~10x while keeping dashboard aggregates representative.
+    private static final int RECORD_SAMPLE_RATE = 10;
+    private final java.util.concurrent.atomic.AtomicLong recordSampleCounter = new java.util.concurrent.atomic.AtomicLong(0);
 
     public BiddingService(BidderProperties properties,
                           CreativeCache creativeCache,
@@ -108,10 +119,11 @@ public class BiddingService {
         String deviceType = request.targeting() == null ? null : request.targeting().deviceType();
         String audienceSegment = request.targeting() == null ? null : request.targeting().audienceSegment();
 
-        return creativeCache.getAll().collectList().flatMap(all -> {
-            if (all.isEmpty()) {
-                return noBid(record, "no_eligible_creative", start);
-            }
+        // Read the catalog from the in-memory snapshot — no Redis GET / JSON deserialize per bid.
+        List<Creative> all = creativeCache.getAllCached();
+        if (all.isEmpty()) {
+            return noBid(record, "no_eligible_creative", start);
+        }
             // F3: a creative must never be chosen for a floor above its cap — checked before
             // targeting and budget.
             List<Creative> withinMax = all.stream()
@@ -127,60 +139,58 @@ public class BiddingService {
             if (matched.isEmpty()) {
                 return noBid(record, "targeting_miss", start);
             }
-            // F2: only creatives that still have budget (> 0). One Redis read per matched
-            // creative, run concurrently; carry the remaining budget along for ranking + pacing.
-            return Flux.fromIterable(matched)
-                    .flatMap(c -> statsCache.getRemainingBudget(c.getId())
-                            .map(budget -> Map.entry(c, budget)))
-                    .filter(e -> e.getValue() > 0)
-                    .collectList()
-                    .flatMap(eligible -> {
-                        if (eligible.isEmpty()) {
-                            return noBid(record, "budget_exhausted", start);
-                        }
-                        // Prefer the most specific creative (fewer wildcard fields), so the
-                        // Universal creative is a fallback rather than the default; tie-break on
-                        // higher remaining budget to spread spend across creatives.
-                        Map.Entry<Creative, Double> best = eligible.stream()
-                                .max(Comparator
-                                        .comparingInt((Map.Entry<Creative, Double> e) -> specificity(e.getKey()))
-                                        .thenComparingDouble(Map.Entry::getValue))
-                                .orElseThrow();
-                        Creative creative = best.getKey();
-                        double remaining = best.getValue();
+            // F2: only creatives that still have budget. Read the in-memory budget snapshot
+            // (refreshed ~1s off the event loop) instead of one Redis GET per matched creative on
+            // the hot path — a synchronous O(1) lookup. A missing key defaults to the full budget
+            // so a cold/empty snapshot never wrongly no-bids; a small floor (> 5) skips creatives
+            // that are effectively drained.
+            Map<String, Double> budgets = getBudgetSnapshot();
+            double full = properties.getCreativeBudget();
+            List<Map.Entry<Creative, Double>> eligible = matched.stream()
+                    .map(c -> Map.entry(c, budgets.getOrDefault(c.getId(), full)))
+                    .filter(e -> e.getValue() > 5.0)
+                    .toList();
+            if (eligible.isEmpty()) {
+                return noBid(record, "budget_exhausted", start);
+            }
+            // Prefer the most specific creative (fewer wildcard fields), so the
+            // Universal creative is a fallback rather than the default; tie-break on
+            // higher remaining budget to spread spend across creatives.
+            Map.Entry<Creative, Double> best = eligible.stream()
+                    .max(Comparator
+                            .comparingInt((Map.Entry<Creative, Double> e) -> specificity(e.getKey()))
+                            .thenComparingDouble(Map.Entry::getValue))
+                    .orElseThrow();
+            Creative creative = best.getKey();
+            double remaining = best.getValue();
 
-                        // Pacing throttle: when we are ahead of the back-loaded target spend curve,
-                        // probabilistically skip the auction instead of just shaving the price. In a
-                        // second-price auction a floored bid still WINS and still SPENDS, so price
-                        // cuts alone can't conserve budget — skipping does. Released in the endgame
-                        // (see shouldThrottle) so banked budget is spent down on cheap, uncontested
-                        // late auctions, which is where the fill rate collapses and wins are cheapest.
-                        PacingState pacing = pacingState(remaining);
-                        if (shouldThrottle(pacing)) {
-                            return noBid(record, "paced_throttle", start);
-                        }
+            // Linear pacing: skip only when we are running ahead of the EVEN target spend line for
+            // this point in the window (see shouldBid). Unlike the old back-loaded throttle, this
+            // fills steadily across the whole competition rather than banking budget for the endgame.
+            if (!shouldBid()) {
+                return noBid(record, "paced", start);
+            }
 
-                        double bidPrice = computeBidPrice(request, pacing);
+            PacingState pacing = pacingState(remaining);
+            double bidPrice = computeBidPrice(request, pacing);
 
-                        // Let the win-notice consumer attribute a win to this bid without a DB hit.
-                        ownBidCache.record(request.requestId(), creative.getId(), bidPrice);
+            // Let the win-notice consumer attribute a win to this bid without a DB hit.
+            ownBidCache.record(request.requestId(), creative.getId(), bidPrice);
 
-                        record.setBidPrice(bidPrice);
-                        record.setCreativeId(creative.getId());
-                        record.setLatencyMs(elapsedMs(start));
-                        metrics.recordBid();
-                        metrics.recordLatency(elapsedMs(start));
+            record.setBidPrice(bidPrice);
+            record.setCreativeId(creative.getId());
+            record.setLatencyMs(elapsedMs(start));
+            metrics.recordBid();
+            metrics.recordLatency(elapsedMs(start));
 
-                        BidResponse response = new BidResponse(
-                                request.requestId(), bidPrice, toCreativeDto(creative));
-                        // Persist the bid record OFF the response path: the SSP response must not wait
-                        // on a Postgres INSERT (a shared DB under load was our biggest latency/timeout
-                        // source). Fire-and-forget on the DB scheduler; a write failure is logged, not
-                        // surfaced to the auction.
-                        saveRecordAsync(record);
-                        return Mono.just(Optional.of(response));
-                    });
-        });
+            BidResponse response = new BidResponse(
+                    request.requestId(), bidPrice, toCreativeDto(creative));
+            // Persist the bid record OFF the response path: the SSP response must not wait
+            // on a Postgres INSERT (a shared DB under load was our biggest latency/timeout
+            // source). Fire-and-forget on the DB scheduler; a write failure is logged, not
+            // surfaced to the auction.
+            saveRecordAsync(record);
+            return Mono.just(Optional.of(response));
     }
 
     /** Record a no-bid with its reason + latency and return an empty (204) response. */
@@ -196,11 +206,18 @@ public class BiddingService {
     }
 
     /**
-     * Persist a bid record without blocking the auction response. Subscribed on the bounded-elastic
-     * scheduler so the blocking-capable R2DBC save never runs on the Netty event loop, and any error
-     * is logged rather than failing (or delaying) the bid we already returned.
+     * Persist a SAMPLE of bid records without blocking the auction response. Only ~1 in
+     * {@link #RECORD_SAMPLE_RATE} records is written, cutting Postgres INSERT volume ~10x while
+     * keeping StatsService aggregates (latency percentiles, no-bid reason mix, per-dimension win
+     * rates) representative. Absolute dashboard counts are therefore a ~10x-scaled sample; exact
+     * win counts still come from WinNotice/Kafka, not from these records. The sampled write is
+     * subscribed on the bounded-elastic scheduler so the blocking-capable R2DBC save never runs on
+     * the Netty event loop, and any error is logged rather than failing the bid we already returned.
      */
     private void saveRecordAsync(BidRecord record) {
+        if (recordSampleCounter.incrementAndGet() % RECORD_SAMPLE_RATE != 0) {
+            return;
+        }
         bidRecordRepository.save(record)
                 .subscribeOn(Schedulers.boundedElastic())
                 .subscribe(
@@ -289,39 +306,54 @@ public class BiddingService {
     }
 
     /**
-     * Should we skip this auction to conserve budget? A price cut alone can't conserve budget in a
-     * second-price auction (a floored bid still wins and still spends), so when we are ahead of the
-     * back-loaded target curve we probabilistically no-bid instead. Once past the release fraction
-     * we never throttle — the endgame is where fill rate collapses and wins are cheapest, so we
-     * spend the banked budget down there.
+     * Per-creative remaining-budget snapshot for the bid hot path. Refreshed at most once per
+     * second, and the refresh runs OFF the event loop (subscribed on the bounded-elastic scheduler)
+     * so a bid never blocks on Redis — it always reads the current, possibly-stale, snapshot
+     * synchronously. On a refresh failure the previous snapshot is retained. lastBudgetFetch is
+     * stamped before dispatching so only one refresh is ever in flight at a time.
      */
-    private boolean shouldThrottle(PacingState p) {
-        BidderProperties.Strategy s = properties.getStrategy();
-        if (p.elapsedFraction() >= s.getThrottleReleaseFraction()) {
-            return false;
+    private Map<String, Double> getBudgetSnapshot() {
+        long now = System.currentTimeMillis();
+        if (now - lastBudgetFetch > 1000) {
+            lastBudgetFetch = now;
+            getRemainingBudgets()
+                    .subscribeOn(Schedulers.boundedElastic())
+                    .subscribe(
+                            fresh -> budgetSnapshot = fresh,
+                            e -> log.warn("Budget snapshot refresh failed — keeping stale snapshot (non-fatal): {}",
+                                    e.getMessage()));
         }
-        double ahead = p.spentFraction() - targetSpent(p.elapsedFraction());
-        if (ahead <= 0.0) {
-            return false; // on or behind the target curve — always bid
-        }
-        double skipProb = Math.min(s.getThrottleMaxSkip(), s.getThrottleSensitivity() * ahead);
-        return Math.random() < skipProb;
+        return budgetSnapshot;
+    }
+
+    /** Record cleared spend (from a confirmed win) so linear pacing tracks live spend. */
+    public void recordSpend(double amount) {
+        totalSpentCents.addAndGet((long) (amount * 100));
+    }
+
+    /**
+     * Linear pacing gate: bid only while our actual cleared spend is below the EVEN target spend
+     * for the elapsed fraction of the competition window (times a small tolerance so we stay
+     * mildly ahead). This spreads spend across the whole window — a steady fill — rather than
+     * banking budget for the endgame. Elapsed fraction reuses the existing pacing anchor/start-time
+     * resolution via pacingState().
+     */
+    private boolean shouldBid() {
+        double elapsedFraction = pacingState(0).elapsedFraction();
+        int creativeCount = budgetSnapshot.isEmpty() ? 200 : budgetSnapshot.size();
+        double totalBudget = properties.getCreativeBudget() * creativeCount;
+        double expectedSpend = elapsedFraction * totalBudget;
+        double actualSpend = totalSpentCents.get() / 100.0;
+        return actualSpend < expectedSpend * PACING_TOLERANCE;
     }
 
     private double pacingMultiplier(PacingState p) {
         BidderProperties.Strategy s = properties.getStrategy();
-        // Endgame spend-down: once the throttle has released, any budget still unspent is a wasted
-        // win (the score is win COUNT, so an undrained dollar is pure loss). Late auctions clear at
-        // ~floor and fill rate is collapsing, so winning MORE of the scarce inventory is the only
-        // way to drain in time — bid at the max boost, not just at market, while budget remains.
         if (p.elapsedFraction() >= s.getThrottleReleaseFraction() && p.spentFraction() < 1.0) {
             return s.getPacingBoost();
         }
-        // Otherwise a continuous, proportional response against the same back-loaded target the
-        // throttle uses: bid up when behind the target curve, down when ahead of it.
         double gap = targetSpent(p.elapsedFraction()) - p.spentFraction();
         double multiplier = 1.0 + s.getPacingSensitivity() * gap;
-        // Clamp so a big gap can't send the bid to an absurd multiple or below the floor guard.
         return Math.max(s.getPacingCut(), Math.min(s.getPacingBoost(), multiplier));
     }
 

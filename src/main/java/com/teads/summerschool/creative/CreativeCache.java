@@ -3,12 +3,14 @@ package com.teads.summerschool.creative;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.teads.summerschool.config.BidderProperties;
+import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.core.ReactiveRedisTemplate;
 import org.springframework.stereotype.Component;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 import java.time.Duration;
 import java.util.List;
@@ -35,6 +37,16 @@ public class CreativeCache {
 
     // Safety net for a missed write-path invalidation; short enough to self-heal quickly.
     private static final Duration TTL = Duration.ofSeconds(60);
+
+    // Refresh interval for the in-memory catalog snapshot below. The catalog is effectively static
+    // after seeding, so a long interval keeps background Redis reads rare.
+    private static final long MEM_REFRESH_MS = 30_000;
+
+    // In-memory catalog snapshot read synchronously on the bid hot path — no Redis GET and no
+    // 200-creative JSON deserialize per bid. Refreshed at most every MEM_REFRESH_MS off the event
+    // loop; primed at startup so the first bid already has it.
+    private volatile List<Creative> memSnapshot = List.of();
+    private volatile long lastMemFetch = 0;
 
     private final CreativeRepository repository;
     private final BidderProperties properties;
@@ -68,6 +80,53 @@ public class CreativeCache {
                     log.warn("Creative cache read failed, falling back to Postgres: {}", e.getMessage());
                     return repository.findByBidderId(properties.getId());
                 });
+    }
+
+    /**
+     * Synchronous, allocation-free read of the catalog for the bid hot path: returns the
+     * in-memory snapshot with NO Redis GET and NO JSON deserialize per bid. At most once every
+     * {@link #MEM_REFRESH_MS} it kicks off a background refresh (off the event loop via
+     * boundedElastic) from {@link #getAll()} — which itself is Redis-cache-aside with a Postgres
+     * fallback — and updates the snapshot when it completes. A refresh failure keeps the stale
+     * snapshot. The snapshot is primed at startup (see {@link #primeMemSnapshot()}) so the very
+     * first bid already has the catalog and never blocks.
+     */
+    public List<Creative> getAllCached() {
+        long now = System.currentTimeMillis();
+        // Refresh on the interval, OR immediately while the snapshot is still empty — the latter
+        // covers first boot, where CreativeSeeder (an ApplicationRunner) seeds AFTER this bean's
+        // @PostConstruct prime, so the prime can see an empty DB. Once populated, only the interval
+        // triggers refreshes.
+        if (memSnapshot.isEmpty() || now - lastMemFetch > MEM_REFRESH_MS) {
+            lastMemFetch = now;
+            getAll().collectList()
+                    .subscribeOn(Schedulers.boundedElastic())
+                    .subscribe(
+                            list -> memSnapshot = list,
+                            e -> log.warn("Creative mem-snapshot refresh failed — keeping stale (non-fatal): {}",
+                                    e.getMessage()));
+        }
+        return memSnapshot;
+    }
+
+    /**
+     * Prime the in-memory catalog snapshot once at startup so the first bid is already served from
+     * memory. Bounded blocking is fine here — it runs on the startup thread, not the event loop.
+     */
+    @PostConstruct
+    void primeMemSnapshot() {
+        try {
+            List<Creative> list = getAll().collectList().block(Duration.ofSeconds(10));
+            if (list != null) {
+                memSnapshot = list;
+                lastMemFetch = System.currentTimeMillis();
+                log.info("Creative catalog primed in memory: {} creatives", list.size());
+            }
+        } catch (Exception e) {
+            // Non-fatal: leave the snapshot empty; the first getAllCached() call will trigger a
+            // background refresh, and BiddingService treats an empty catalog as a no-bid.
+            log.warn("Creative catalog prime failed (non-fatal), will refresh lazily: {}", e.getMessage());
+        }
     }
 
     private Flux<Creative> loadFromDbAndCache(String key) {
